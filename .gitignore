@@ -11,3 +11,6 @@ eval_bundle/
 # Local setup
 CLAUDE.md
 wandb/
+
+# local training data (do not upload)
+base_data_climbmix/
