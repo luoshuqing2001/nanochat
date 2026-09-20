@@ -14,3 +14,21 @@ wandb/
 
 # local training data (do not upload)
 base_data_climbmix/
+base_data/
+
+# Experiment logs: the small text record under logs/<run_id>/ is committed on purpose
+# (config.json, env.txt, command.txt, train.log, metrics.jsonl, summary.*), so only
+# heavy or noisy artifacts are excluded here.
+logs/**/*.pt
+logs/**/*.pth
+logs/**/*.safetensors
+logs/*_smoke_*/
+*.screenlog
+
+# Local tooling / build cruft
+.claude/settings.local.json
+.ipynb_checkpoints/
+*.egg-info/
+build/
+dist/
+.DS_Store
