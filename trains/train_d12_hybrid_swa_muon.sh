@@ -227,6 +227,9 @@ fi
 # Configuration (every knob is an env var override)
 # -----------------------------------------------------------------------------
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+# stdout is a pipe here (we tee into train.log), so python would block-buffer it in 8KB
+# chunks and the log would lag ~50 step lines behind. Keep it line-buffered instead.
+export PYTHONUNBUFFERED=1
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"   # tokenizer, checkpoints, eval bundle
 export NANOCHAT_DATA_DIR="${NANOCHAT_DATA_DIR:-$REPO_DIR/base_data_climbmix}"  # ClimbMix shards (dataset.py honors this)
 mkdir -p "$NANOCHAT_BASE_DIR"
