@@ -1,0 +1,38 @@
+{
+  "gpu": "NVIDIA GB10",
+  "compute_dtype": "torch.bfloat16",
+  "vocab_size": 32768.0,
+  "flops_per_token": 759696000.0,
+  "num_iterations": 2520.0,
+  "total_tokens": 1321205760.0,
+  "tokens_per_scaling_param": 12.0,
+  "total_train_flops": 1.003715e+18,
+  "grad_accum_steps": 16.0,
+  "peak_memory_mib": 15910.63,
+  "train_time_min": 437.38,
+  "min_val_bpb": 0.843776,
+  "model_config": {
+    "sequence_len": 2048,
+    "vocab_size": 32768,
+    "n_layer": 12,
+    "n_head": 6,
+    "n_kv_head": 6,
+    "n_embd": 768,
+    "window_pattern": "SSSL"
+  },
+  "param_counts": {
+    "wte": 25165824,
+    "value_embeds": 150994944,
+    "lm_head": 25165824,
+    "transformer_matrices": 84935088,
+    "scalars": 50,
+    "total": 286261730
+  },
+  "steps_logged": 2520,
+  "last_step": 2519,
+  "final_train_loss_ema": 2.785439,
+  "median_dt_ms": 10404.65,
+  "median_tok_per_sec": 50389,
+  "final_val_bpb": 0.843776,
+  "best_val_bpb": 0.843776
+}
