@@ -127,11 +127,16 @@ bash trains/train_d12_hybrid_swa_muon.sh --summarize logs/<run_id>
   (`flash_attn_4/`, see its `VENDOR.md`), wrapped in torch.library custom ops so the
   compiled model keeps a single graph. `NANOCHAT_ATTN=sdpa` falls back to PyTorch SDPA,
   where sliding-window layers build an explicit mask and cost ~6.5x more.
-- Measured at `DEVICE_BATCH_SIZE=16`: ~44.9k tok/s with FA4 vs ~28.9k with SDPA
-  (727 ms vs 1150 ms per micro-batch), ~15 GiB peak. bs=32 is slower, bs=8 slightly slower.
-- The default compute-optimal horizon (`--target-param-data-ratio 12`) is 2,682 steps
-  x 524,288 tokens = 1.41B tokens ≈ **8-9 h** with FA4 (13-14 h on SDPA). Use
-  `NUM_ITERATIONS` for shorter runs.
+- Throughput vs `DEVICE_BATCH_SIZE` (FA4, measured): 16 -> ~45.5k tok/s / 15.1 GiB,
+  **32 -> ~49.1k tok/s / 28.0 GiB (the default)**, 64 -> killed by the OS. GB10's memory
+  is unified, so torch competes with the page cache that streaming parquet shards fill.
+  This knob is throughput-only: grad accumulation keeps `TOTAL_BATCH_SIZE` fixed, so the
+  optimization is unchanged. (Under the old SDPA path bs=32 was *slower* -- FA4 reversed it.)
+- Do not raise `TOTAL_BATCH_SIZE` for speed: it changes the optimization (base_train
+  rescales LRs by sqrt(B/B_ref) and the weight decay), and 524,288 is exactly what the
+  repo's scaling law computes as optimal for d12 (`TOTAL_BATCH_SIZE=-1` reproduces it).
+- A compute-optimal d12 run (2,520 steps x 524,288 tokens = 1.32B tokens) took **7.3 h**
+  at bs 16 with FA4; expect ~6.8 h at bs 32. Use `NUM_ITERATIONS` for shorter runs.
 - base_train.py still prints "Flash Attention 3 not available, using PyTorch SDPA
   fallback" and warns that sliding-window utilization will be terrible. That message
   only looks at FA3 and is stale when FA4 is active; check `train.log` for the real
