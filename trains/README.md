@@ -3,9 +3,42 @@
 Experiment launchers. Each launch writes **everything about one run** into its own
 folder under `nanochat/logs/<RUN_NAME>_<YYYYmmdd_HHMMSS>/`.
 
-Layout: `train_d12_hybrid_swa_muon.sh` is the entire launcher (config, preflight,
-provenance, training, evaluation, log parsing, summary). `_stubs/wandb.py` is an
-import-only fallback.
+Layout: `_engine_hybrid_swa_muon.sh` is the launcher itself (config, preflight,
+provenance, training, evaluation, log parsing, summary). One wrapper per model size
+sets `DEPTH` and the knobs measured for it, then execs the engine, so every size gets
+the same machinery and there is one place to fix. `_stubs/wandb.py` is an import-only
+fallback.
+
+## Sizes
+
+```bash
+bash trains/train_d12_hybrid_swa_muon.sh     # ... d16, d20, d24, d32, d40, d48
+```
+
+All of them: hybrid SWA (`--window-pattern SSSL`), MuonAdamW, seq_len 2048, data:param
+ratio 12, `TOTAL_BATCH_SIZE=-1` so base_train's scaling law picks the tokens per step.
+
+| depth | dim | params | tokens | steps | micro-batch on GB10 | GB10 throughput | GB10 wall clock |
+|---|---|---|---|---|---|---|---|
+| 12 | 768 | 286M | 1.32B | 2,520 | 32 | 49.1k tok/s | **7.3 h (measured)** |
+| 16 | 1024 | 537M | 2.82B | 5,376 | 16 | 23.0k tok/s | ~34 h |
+| 20 | 1280 | 897M | 5.22B | 4,980 | 8 | 10.3k tok/s | ~5.8 days |
+| 24 | 1536 | 1.38B | 8.76B | 8,352 | 4 | 4.7k tok/s | ~22 days |
+| 32 | 2048 | 2.82B | 20.1B | 9,600 | — | — | ~6 months (extrapolated) |
+| 40 | 2560 | 4.99B | 38.8B | 18,480 | — | — | ~2.5 years (extrapolated) |
+| 48 | 3072 | 8.05B | 66.4B | 31,680 | — | — | does not fit |
+
+Throughput and micro-batch for d12-d24 are measured on this box; d32-d48 are sized for
+a datacenter GPU and their wrappers say so. **d48 does not fit a GB10 at all**: fp32
+master weights, gradients and Muon momentum come to ~78 GB of its 121 GB unified
+memory before any activations, and that memory is shared with the page cache.
+
+The micro-batch numbers are not "as large as fits". GB10 has a throughput cliff once
+torch's peak passes roughly 25-30 GiB, because its memory is unified and streaming the
+parquet shards fills the page cache. Measured at d16: bs 16 -> 23.0k tok/s (25 GiB),
+bs 32 -> 10.8k tok/s (47 GiB). Same shape at d20 (1.9x) and d24 (1.6x). On a
+discrete-HBM datacenter card this cliff does not exist and the wrappers point at much
+larger values.
 
 ## d12 hybrid-SWA + Muon
 
