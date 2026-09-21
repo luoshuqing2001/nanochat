@@ -64,6 +64,7 @@ parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning ra
 parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--muon-variant", type=str, default="nanochat", choices=["nanochat", "moonlight"], help="Muon update rule: 'nanochat' (MuonEq + Muon+ + NorMuon + cautious decay) or 'moonlight' (RMS-matched update + decoupled decay, arxiv 2502.16982). They need different --matrix-lr; see nanochat/optim.py")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
@@ -315,7 +316,16 @@ optimizer = model.setup_optimizer(
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    muon_variant=args.muon_variant,
 )
+print0(f"Muon variant: {args.muon_variant}")
+if args.muon_variant == "moonlight" and args.matrix_lr > 0.01:
+    print0("!" * 80)
+    print0(f"WARNING: --matrix-lr={args.matrix_lr} looks like a default tuned for the 'nanochat' Muon.")
+    print0("WARNING: the moonlight variant pins the update RMS at 0.2 regardless of matrix shape,")
+    print0("WARNING: which makes its update 0.2*sqrt(max(m,n)) larger at the same LR (~11x for 768x3072).")
+    print0("WARNING: ~0.004 matches the default variant's update:param ratio at d12.")
+    print0("!" * 80)
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)

@@ -99,6 +99,39 @@ WARMUP_STEPS, WARMDOWN_RATIO, NUM_ITERATIONS, TARGET_PARAM_DATA_RATIO, EVAL_EVER
 EVAL_TOKENS, SAMPLE_EVERY, SAVE_EVERY, CORE_METRIC_EVERY, FINAL_EVAL, WANDB_RUN,
 NPROC_PER_NODE, PYTHON_BIN, NANOCHAT_BASE_DIR`.
 
+### Muon variants
+
+`MUON_VARIANT` picks the update rule for the matrix parameters:
+
+```bash
+MUON_VARIANT=moonlight bash trains/train_d12_hybrid_swa_muon.sh
+```
+
+| | `nanochat` (default) | `moonlight` |
+|---|---|---|
+| orthogonalization | Polar Express, 5 steps | Polar Express, 5 steps |
+| pre-conditioning | MuonEq row equilibration | none |
+| post-scaling | Muon+ Frobenius renorm, then NorMuon variance reduction | update RMS matched to AdamW: `0.2*sqrt(max(m,n))` |
+| weight decay | cautious (only where update and weight agree in sign) | decoupled, all elements |
+| default `MATRIX_LR` | 0.02 | 0.004 |
+
+Moonlight is [arxiv 2502.16982](https://arxiv.org/abs/2502.16982). Its point is that a
+semi-orthogonal m x n update has element RMS `1/sqrt(max(m,n))`, so its magnitude depends
+on the shape and one learning rate cannot serve the whole model; rescaling to a fixed RMS
+of 0.2 (AdamW's typical update RMS) removes that and is what lets the LR transfer across
+shapes and scales. Verified here, one step at lr 0.01: the default variant produces update
+RMS/lr of 0.036 / 0.018 / 0.036 for 768x768, 768x3072 and 3072x768 (exactly the predicted
+shape dependence), while moonlight gives 0.201 / 0.199 / 0.199.
+
+**The two variants need different learning rates.** At the same LR a moonlight update is
+`0.2*sqrt(max(m,n))` larger -- about 11x for a 768x3072 matrix -- so reusing 0.02 would
+blow up. The 0.004 default was calibrated by matching the measured `update_ratio/muon`
+diagnostic of the default variant (3.1e-3 over the first 20 steps at d12); it is a
+starting point, not a tuned value, and base_train warns if a moonlight run is given an
+LR above 0.01. No quality claim is made either way: the short runs used for calibration
+are all inside the LR warmup and say nothing about final loss. That comparison is the
+experiment to run.
+
 ### Model internals
 
 base_train.py logs loss and throughput only. `nanochat/diagnostics.py` adds the

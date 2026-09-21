@@ -270,7 +270,7 @@ write_run_header() {
     UNEMBEDDING_LR="$UNEMBEDDING_LR" SCALAR_LR="$SCALAR_LR" \
     NUM_ITERATIONS="$NUM_ITERATIONS" TARGET_PARAM_DATA_RATIO="$TARGET_PARAM_DATA_RATIO" \
     NPROC_PER_NODE="$NPROC_PER_NODE" NUM_SHARDS="$NUM_SHARDS" \
-    DIAGNOSTICS_EVERY="$DIAGNOSTICS_EVERY" \
+    DIAGNOSTICS_EVERY="$DIAGNOSTICS_EVERY" MUON_VARIANT="$MUON_VARIANT" \
     GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
     GIT_DIRTY="$(git status --porcelain 2>/dev/null | wc -l)" \
     "$PYTHON_BIN" - <<'RUN_HEADER_PY'
@@ -338,6 +338,7 @@ try:
     line("", " ".join(f"L{i:02d}:{'S' if w < seq_len else 'L'}{w}" for i, w in enumerate(windows)))
 
     # optimizer composition
+    muon_variant = os.environ.get("MUON_VARIANT", "nanochat")
     with contextlib.redirect_stdout(io.StringIO()):
         opt = model.setup_optimizer(
             unembedding_lr=float(os.environ["UNEMBEDDING_LR"]),
@@ -345,6 +346,7 @@ try:
             scalar_lr=float(os.environ["SCALAR_LR"]),
             matrix_lr=float(os.environ["MATRIX_LR"]),
             weight_decay=float(os.environ["WEIGHT_DECAY"]),
+            muon_variant=muon_variant,
         )
     kinds = {}
     for g in opt.param_groups:
@@ -353,8 +355,15 @@ try:
         k["tensors"] += len(g["params"])
         k["params"] += n
         k["lrs"].append(g["lr"])
+    variant_desc = {
+        "nanochat": "MuonEq row equilibration + Polar Express + Muon+ renorm + NorMuon "
+                    "variance reduction + cautious weight decay",
+        "moonlight": "Polar Express + update RMS matched to AdamW (0.2*sqrt(max(m,n))) "
+                     "+ decoupled weight decay (arxiv 2502.16982)",
+    }.get(muon_variant, "unknown variant")
     line("Optimizer", f"{type(opt).__name__} -- Muon on the transformer matrices, "
                       "AdamW on embeddings and scalars")
+    line("", f"muon variant '{muon_variant}': {variant_desc}")
     for kind, k in kinds.items():
         lrs = ", ".join(str(x) for x in sorted({round(x, 6) for x in k["lrs"]}))
         line("", f"{kind:5s} {k['tensors']:3d} tensors, {k['params']:>12,} params, lr {lrs}")
@@ -425,7 +434,18 @@ ASPECT_RATIO="${ASPECT_RATIO:-64}"               # model_dim = depth * aspect_ra
 # optimization (Muon on matrices, AdamW on the rest)
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-32}"    # fastest on 1x GB10 with FA4 (64 is OOM-killed); lower to 16/8 if you OOM
 TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:-524288}"   # tokens per optimizer step (-1 = auto)
-MATRIX_LR="${MATRIX_LR:-0.02}"                   # Muon lr
+# Muon update rule: 'nanochat' (MuonEq + Muon+ + NorMuon + cautious decay) or
+# 'moonlight' (RMS-matched update + decoupled decay, arxiv 2502.16982). The two need
+# different MATRIX_LR -- at the same LR a Moonlight update is 0.2*sqrt(max(m,n)) larger.
+MUON_VARIANT="${MUON_VARIANT:-nanochat}"
+# Default LR follows the variant. 0.004 for moonlight was calibrated on this repo by
+# matching the measured update:param ratio of the default variant at its own LR
+# (3.1e-3 over the first 20 steps at d12); it is a starting point, not a tuned value.
+if [ "$MUON_VARIANT" = "moonlight" ]; then
+    MATRIX_LR="${MATRIX_LR:-0.004}"
+else
+    MATRIX_LR="${MATRIX_LR:-0.02}"
+fi
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.28}"             # Muon cautious weight decay
 EMBEDDING_LR="${EMBEDDING_LR:-0.3}"
 UNEMBEDDING_LR="${UNEMBEDDING_LR:-0.008}"
@@ -541,6 +561,7 @@ cat > "$RUN_DIR/config.json" <<JSON
   "head_dim": $HEAD_DIM,
   "aspect_ratio": $ASPECT_RATIO,
   "optimizer": "MuonAdamW (Muon on matrices, AdamW on embeddings/scalars)",
+  "muon_variant": "$MUON_VARIANT",
   "device_batch_size": $DEVICE_BATCH_SIZE,
   "total_batch_size": $TOTAL_BATCH_SIZE,
   "matrix_lr": $MATRIX_LR,
@@ -580,6 +601,7 @@ TRAIN_ARGS=(
     --device-batch-size="$DEVICE_BATCH_SIZE"
     --total-batch-size="$TOTAL_BATCH_SIZE"
     --matrix-lr="$MATRIX_LR"
+    --muon-variant="$MUON_VARIANT"
     --weight-decay="$WEIGHT_DECAY"
     --embedding-lr="$EMBEDDING_LR"
     --unembedding-lr="$UNEMBEDDING_LR"

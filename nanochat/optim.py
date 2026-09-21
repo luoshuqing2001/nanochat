@@ -179,6 +179,79 @@ def muon_step_fused(
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
+"""
+Moonlight-style Muon.
+https://arxiv.org/abs/2502.16982 (Moonshot AI, "Muon is Scalable for LLM Training")
+
+Two changes relative to the Muon above, and they are the whole point of the variant:
+
+1) The orthogonalized update is rescaled so its RMS matches AdamW's. A semi-orthogonal
+   m x n matrix has Frobenius norm sqrt(min(m, n)), i.e. element RMS 1/sqrt(max(m, n)),
+   which shrinks as matrices get wider -- so a single learning rate cannot serve
+   parameters of different shapes. Multiplying by 0.2 * sqrt(max(m, n)) pins the update
+   RMS at 0.2 regardless of shape, which is what lets Moonlight share one LR across the
+   whole model and transfer it across scales.
+2) Plain decoupled weight decay, applied to every element, instead of nanochat's
+   cautious variant that only decays where the update and the weight agree in sign.
+
+Everything nanochat layers on top of Muon (MuonEq row equilibration, the Muon+ Frobenius
+renormalization, NorMuon variance reduction) is deliberately absent here: this variant
+exists to be compared against those, so it stays close to the paper. The orthogonalization
+itself still uses Polar Express rather than the paper's classic Newton-Schulz quintic --
+it computes the same thing with better convergence, and keeping it constant across
+variants keeps the comparison about the update rule.
+
+Note that the two variants need different learning rates: at the same LR the Moonlight
+update is 0.2 * sqrt(max(m, n)) times larger, which is ~11x for a 768x3072 matrix. See
+--muon-variant in scripts/base_train.py.
+"""
+
+
+@torch.compile(dynamic=False, fullgraph=True)
+def muon_step_fused_moonlight(
+    stacked_grads: Tensor,          # (K, m, n) - stacked gradients
+    stacked_params: Tensor,         # (K, m, n) - stacked parameters
+    momentum_buffer: Tensor,        # (K, m, n) - first moment buffer
+    momentum_t: Tensor,             # () - 0-D CPU tensor, momentum coefficient
+    lr_t: Tensor,                   # () - 0-D CPU tensor, learning rate
+    wd_t: Tensor,                   # () - 0-D CPU tensor, weight decay
+    rms_scale_t: Tensor,            # () - 0-D CPU tensor, 0.2 * sqrt(max(m, n))
+    ns_steps: int,                  # 5 - number of Polar Express iterations
+) -> None:
+    """Fused Moonlight Muon step: momentum -> orthogonalize -> RMS match -> decoupled decay."""
+
+    # Nesterov momentum
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+
+    # bf16 for the orthogonalization when available (fp16's exponent range is too small)
+    X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
+
+    # Polar Express orthogonalization (same operator as the default variant)
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+    if g.size(-2) > g.size(-1):  # Tall matrix
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X.mT @ X
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else:  # Wide matrix
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    g = X.to(stacked_params.dtype)
+
+    # Moonlight: match the update RMS to AdamW's, independently of the matrix shape
+    g = g * rms_scale_t.to(g.dtype)
+
+    # Decoupled weight decay, then the update
+    lr = lr_t.to(g.dtype)
+    wd = wd_t.to(g.dtype)
+    stacked_params.mul_(1 - lr * wd)
+    stacked_params.sub_(lr * g)
+
+
 # -----------------------------------------------------------------------------
 
 class MuonAdamW(torch.optim.Optimizer):
@@ -270,6 +343,7 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_rms_scale_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
     def _reduce_adamw(self, group: dict, world_size: int) -> dict:
         """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
@@ -374,10 +448,12 @@ class MuonAdamW(torch.optim.Optimizer):
         num_owned = min(chunk_size, max(0, len(params) - start_idx))
 
         # Get or create group-level state
+        variant = group.get("variant", "nanochat")
         state = self.state[p]
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
+        if variant != "moonlight" and "second_momentum_buffer" not in state:
+            # NorMuon's factored second moment; the Moonlight variant has no second moment
             state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
@@ -387,17 +463,29 @@ class MuonAdamW(torch.optim.Optimizer):
             owned_params = [params[start_idx + i] for i in range(num_owned)]
             stacked_owned = torch.stack(owned_params)
 
-            # Fill 0-D tensors and run fused kernel
+            # Fill 0-D tensors and run the fused kernel for this variant
             self._muon_momentum_t.fill_(group["momentum"])
-            self._muon_beta2_t.fill_(group["beta2"])
-            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
-            muon_step_fused(
-                grad_chunk[:num_owned], stacked_owned,
-                state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
-                self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-                group["ns_steps"], red_dim,
-            )
+            if variant == "moonlight":
+                # The RMS matching subsumes Muon's aspect-ratio LR correction, so the
+                # group LR is used as-is here.
+                self._muon_lr_t.fill_(group["lr"])
+                self._muon_rms_scale_t.fill_(0.2 * max(shape[-2], shape[-1]) ** 0.5)
+                muon_step_fused_moonlight(
+                    grad_chunk[:num_owned], stacked_owned,
+                    state["momentum_buffer"][:num_owned],
+                    self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
+                    self._muon_rms_scale_t, group["ns_steps"],
+                )
+            else:
+                self._muon_beta2_t.fill_(group["beta2"])
+                self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+                muon_step_fused(
+                    grad_chunk[:num_owned], stacked_owned,
+                    state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
+                    self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+                    group["ns_steps"], red_dim,
+                )
 
         if info['stacked_grads'] is None:
             # Single rank: no gather needed, the updated stack maps directly onto the params
