@@ -13,6 +13,8 @@ Usage (drop-in replacement for FA3):
     # Inference (with KV cache)
     y = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, ...)
 """
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -49,8 +51,31 @@ def _load_flash_attention_3():
 _fa3 = _load_flash_attention_3()
 HAS_FA3 = _fa3 is not None
 
-# Override for testing: set to 'fa3', 'sdpa', or None (auto)
-_override_impl = None
+
+# =============================================================================
+# Detection: Try to load FA4 (CuTe DSL), vendored in flash_attn_4/
+# =============================================================================
+def _load_flash_attention_4():
+    """Try to load Flash Attention 4.
+
+    FA4's CuTe kernels cover the GPUs FA3 has no compiled kernels for, notably
+    Blackwell sm12x (GB10 / DGX Spark), where the alternative is the SDPA
+    fallback with an explicit mask for every sliding-window layer.
+    """
+    if not torch.cuda.is_available():
+        return None
+    try:
+        from flash_attn_4 import fa3_compat  # FA3-shaped adapter, see flash_attn_4/VENDOR.md
+        return fa3_compat if fa3_compat.is_available() else None
+    except Exception:
+        return None
+
+
+_fa4 = _load_flash_attention_4()
+HAS_FA4 = _fa4 is not None
+
+# Override: set to 'fa3', 'fa4', 'sdpa', or None (auto). NANOCHAT_ATTN sets it from the env.
+_override_impl = os.environ.get("NANOCHAT_ATTN") or None
 
 
 def _resolve_use_fa3():
@@ -58,7 +83,7 @@ def _resolve_use_fa3():
     if _override_impl == 'fa3':
         assert HAS_FA3, "Cannot override to FA3: not available on this hardware"
         return True
-    if _override_impl == 'sdpa':
+    if _override_impl in ('sdpa', 'fa4'):
         return False
     if HAS_FA3:
         # FA3 Hopper kernels only support bf16 and fp8; fp16/fp32 must use SDPA fallback
@@ -69,6 +94,33 @@ def _resolve_use_fa3():
     return False
 
 USE_FA3 = _resolve_use_fa3()
+
+
+def _resolve_use_fa4():
+    """Decide once whether to use FA4. FA3 wins when both are available."""
+    if _override_impl == 'fa4':
+        assert HAS_FA4, "Cannot override to FA4: not available (see flash_attn_4/VENDOR.md)"
+        return True
+    if _override_impl in ('sdpa', 'fa3'):
+        return False
+    if HAS_FA4 and not USE_FA3:
+        # FA4 goes through torch.library custom ops (flash_attn_4/fa3_compat.py), so a
+        # compiled model keeps one graph: 0 graph breaks, 727 ms/step vs 1150 ms for
+        # compiled SDPA on GB10 (d12, SSSL, bs 16, seq 2048). Requires the custom-op
+        # wrappers; without them FA4 breaks the graph and loses to SDPA.
+        if not _fa4.has_custom_op():
+            return False
+        # the SM120 kernels are bf16/fp16 only; fp32 stays on SDPA
+        from nanochat.common import COMPUTE_DTYPE
+        return COMPUTE_DTYPE in (torch.bfloat16, torch.float16)
+    return False
+
+USE_FA4 = _resolve_use_fa4()
+
+
+def impl_name():
+    """Which implementation training attention actually runs on: 'fa3' | 'fa4' | 'sdpa'."""
+    return 'fa3' if USE_FA3 else ('fa4' if USE_FA4 else 'sdpa')
 
 
 # =============================================================================
@@ -127,6 +179,11 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     if USE_FA3:
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
+    # FA4 handles the training forward/backward; can_run() guards dtype/head_dim so
+    # anything the CuTe kernels reject (e.g. fp32 eval) still lands on SDPA below.
+    if USE_FA4 and _fa4.can_run(q, window_size):
+        return _fa4.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
@@ -142,6 +199,8 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     Flash Attention with KV cache for inference.
 
     FA3 updates k_cache/v_cache in-place. Our SDPA fallback does the same.
+    FA4 exposes no kvcache entry point, so inference stays on SDPA even when
+    USE_FA4 is set for training.
 
     Args:
         q: Queries, shape (B, T_new, H, D)

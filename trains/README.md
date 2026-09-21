@@ -92,13 +92,19 @@ bash trains/train_d12_hybrid_swa_muon.sh --summarize logs/<run_id>
 
 ### Notes for this machine (1x NVIDIA GB10)
 
-- FA3 has no sm121 kernels, so attention falls back to PyTorch SDPA. Full-context (`L`)
-  layers still take the fast `is_causal` path; sliding-window (`S`) layers build an
-  explicit mask, which works but is slower than a real SWA kernel.
-- Measured: ~28.9k tok/s at `DEVICE_BATCH_SIZE=16`, ~15 GiB peak. bs=32 is *slower*
-  (~24.5k tok/s), bs=8 is ~28.3k.
+- FA3 has no sm121 kernels. Attention runs on the vendored FA4 CuTe kernels
+  (`flash_attn_4/`, see its `VENDOR.md`), wrapped in torch.library custom ops so the
+  compiled model keeps a single graph. `NANOCHAT_ATTN=sdpa` falls back to PyTorch SDPA,
+  where sliding-window layers build an explicit mask and cost ~6.5x more.
+- Measured at `DEVICE_BATCH_SIZE=16`: ~44.9k tok/s with FA4 vs ~28.9k with SDPA
+  (727 ms vs 1150 ms per micro-batch), ~15 GiB peak. bs=32 is slower, bs=8 slightly slower.
 - The default compute-optimal horizon (`--target-param-data-ratio 12`) is 2,682 steps
-  x 524,288 tokens = 1.41B tokens ≈ **13-14 h**. Use `NUM_ITERATIONS` for shorter runs.
+  x 524,288 tokens = 1.41B tokens ≈ **8-9 h** with FA4 (13-14 h on SDPA). Use
+  `NUM_ITERATIONS` for shorter runs.
+- base_train.py still prints "Flash Attention 3 not available, using PyTorch SDPA
+  fallback" and warns that sliding-window utilization will be terrible. That message
+  only looks at FA3 and is stale when FA4 is active; check `train.log` for the real
+  implementation via `python -c "import nanochat.flash_attention as f; print(f.impl_name())"`.
 - MFU prints as 0.00 because `get_peak_flops()` in `nanochat/common.py` has no entry
   for "NVIDIA GB10".
 - `CORE_METRIC_EVERY` / `FINAL_EVAL=...,core` download `eval_bundle.zip` on first use.
