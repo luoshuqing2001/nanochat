@@ -7,7 +7,7 @@
 # Self-contained: this file is the whole experiment launcher (config, preflight,
 # provenance, training, evaluation, log parsing, summary).
 #
-#   bash trains/train_d12_hybrid_swa_muon.sh                  # the real run (~13-14h)
+#   bash trains/train_d12_hybrid_swa_muon.sh                  # the real run (~7h)
 #   DRY_RUN=1 bash trains/train_d12_hybrid_swa_muon.sh        # write config/env, print cmd, don't train
 #   SMOKE=1 bash trains/train_d12_hybrid_swa_muon.sh          # 20-step pipeline check (~1 min)
 #   NUM_ITERATIONS=1000 bash trains/train_d12_hybrid_swa_muon.sh
@@ -33,10 +33,18 @@
 # which nanochat/dataset.py honors. NANOCHAT_BASE_DIR (default ~/.cache/nanochat)
 # stays the home of the tokenizer, the checkpoints and the CORE eval bundle.
 #
-# Measured on 1x NVIDIA GB10 (torch 2.14+cu130, bf16, SDPA fallback since FA3 has
-# no sm121 kernels): ~28.9k tok/s at DEVICE_BATCH_SIZE=16, ~15 GiB peak. bs=32 is
-# slower (~24.5k). The default compute-optimal horizon is 2,682 steps x 524,288
-# tokens = 1.41B tokens, i.e. roughly 13-14 hours.
+# Measured on 1x NVIDIA GB10 (torch 2.14+cu130, bf16, FA4 via torch.library custom
+# ops). Throughput vs DEVICE_BATCH_SIZE, at seq_len 2048:
+#     16 -> ~45.5k tok/s, 15.1 GiB peak
+#     32 -> ~49.1k tok/s, 28.0 GiB peak   (the default)
+#     64 -> killed by the OS: GB10 memory is unified, so torch competes with the
+#           page cache that streaming the parquet shards fills
+# DEVICE_BATCH_SIZE only trades memory for speed -- grad accumulation keeps
+# TOTAL_BATCH_SIZE fixed, so the optimization is identical. It must divide
+# TOTAL_BATCH_SIZE / MAX_SEQ_LEN (= 256 sequences per step by default), i.e. a power
+# of two up to 256, or base_train asserts.
+# A compute-optimal run (2,520 steps x 524,288 tokens = 1.32B) took 7.3 h at bs 16;
+# expect ~6.8 h at 32.
 # =============================================================================
 set -euo pipefail
 
@@ -405,7 +413,7 @@ HEAD_DIM="${HEAD_DIM:-128}"
 ASPECT_RATIO="${ASPECT_RATIO:-64}"               # model_dim = depth * aspect_ratio
 
 # optimization (Muon on matrices, AdamW on the rest)
-DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"     # measured best on 1x GB10; lower to 8/4 if you OOM
+DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-32}"    # fastest on 1x GB10 with FA4 (64 is OOM-killed); lower to 16/8 if you OOM
 TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:-524288}"   # tokens per optimizer step (-1 = auto)
 MATRIX_LR="${MATRIX_LR:-0.02}"                   # Muon lr
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.28}"             # Muon cautious weight decay
