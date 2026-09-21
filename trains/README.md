@@ -73,10 +73,10 @@ NPROC_PER_NODE, PYTHON_BIN, NANOCHAT_BASE_DIR`.
 | `config.json` | every resolved knob + checkpoint dir for this run |
 | `env.txt` | host, GPUs, driver, python/torch versions, git branch/commit/dirty files, data dir + shard count |
 | `command.txt` | the exact `base_train` command line |
-| `train.log` | full training stdout (tee'd live) |
+| `train.log` | a run header (attention backend, optimizer composition, per-layer window sizes, batch/horizon, git commit) followed by the full training stdout, tee'd live |
 | `eval.log` | `scripts/base_eval.py` output, if `FINAL_EVAL` is on |
 | `metrics.jsonl` | one JSON record per logged step / val eval / CORE eval |
-| `summary.json` | run-level numbers (params, horizon, best val bpb, throughput, peak mem) |
+| `summary.json` | run-level numbers (setup, params, horizon, best val bpb, throughput, peak mem) |
 | `summary.md` | the same, human-readable |
 | `checkpoint_meta/` | copies of the checkpoint `meta_*.json` + checkpoint dir size |
 | `checkpoint_path.txt` | where the weights actually are (under `NANOCHAT_BASE_DIR/base_checkpoints/`) |

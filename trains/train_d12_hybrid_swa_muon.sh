@@ -70,6 +70,9 @@ CORE_RE = re.compile(r"Step (\d+) \| CORE metric: ([\d.]+)")
 PARAM_RE = re.compile(r"^(\w+)\s*:\s*([\d,]+)$")
 SCALARS = [
     ("gpu", re.compile(r"^GPU: (.+?) \| Peak FLOPS"), str),
+    ("attention", re.compile(r"^Attention\s+: (.+?)\s*$"), str),
+    ("optimizer", re.compile(r"^Optimizer\s+: (.+?)\s*$"), str),
+    ("attn_layout", re.compile(r"^Attn layout\s+: (.+?)\s*$"), str),
     ("compute_dtype", re.compile(r"^COMPUTE_DTYPE: (\S+)"), str),
     ("data_dir", re.compile(r"DATA_DIR -> (\S+)"), str),
     ("vocab_size", re.compile(r"^Vocab size: ([\d,]+)"), _f),
@@ -189,7 +192,12 @@ if cfg:
           f"- vocab_size: {cfg.get('vocab_size')}", ""]
 if params:
     L += ["## Parameters", ""] + [f"- {k}: {v:,}" for k, v in params.items()] + [""]
-L += ["## Training horizon", ""]
+L += ["## Setup", ""]
+for k, label in [("attention", "attention"), ("optimizer", "optimizer"),
+                 ("attn_layout", "attention layout")]:
+    if k in summary:
+        L.append(f"- {label}: {summary[k]}")
+L += ["", "## Training horizon", ""]
 for k, label in [("total_batch_size", "total batch size (tokens)"), ("grad_accum_steps", "grad accum steps"),
                  ("num_iterations", "iterations"), ("total_tokens", "total training tokens"),
                  ("tokens_per_scaling_param", "tokens : scaling params"),
@@ -214,6 +222,136 @@ with open(os.path.join(run_dir, "summary.md"), "w") as f:
     f.write("\n".join(L))
 print(f"wrote {run_dir}/metrics.jsonl, summary.json, summary.md ({len(records)} records)")
 PYEOF
+}
+
+# -----------------------------------------------------------------------------
+# write_run_header(): what this run actually resolved to -- attention backend,
+# optimizer composition, per-layer window sizes -- none of which base_train.py
+# prints. Goes to the top of train.log so every run is self-describing.
+# -----------------------------------------------------------------------------
+write_run_header() {
+    RUN_ID="$RUN_ID" DEPTH="$DEPTH" ASPECT_RATIO="$ASPECT_RATIO" HEAD_DIM="$HEAD_DIM" \
+    MAX_SEQ_LEN="$MAX_SEQ_LEN" WINDOW_PATTERN="$WINDOW_PATTERN" \
+    DEVICE_BATCH_SIZE="$DEVICE_BATCH_SIZE" TOTAL_BATCH_SIZE="$TOTAL_BATCH_SIZE" \
+    MATRIX_LR="$MATRIX_LR" WEIGHT_DECAY="$WEIGHT_DECAY" EMBEDDING_LR="$EMBEDDING_LR" \
+    UNEMBEDDING_LR="$UNEMBEDDING_LR" SCALAR_LR="$SCALAR_LR" \
+    NUM_ITERATIONS="$NUM_ITERATIONS" TARGET_PARAM_DATA_RATIO="$TARGET_PARAM_DATA_RATIO" \
+    NPROC_PER_NODE="$NPROC_PER_NODE" NUM_SHARDS="$NUM_SHARDS" \
+    GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+    GIT_DIRTY="$(git status --porcelain 2>/dev/null | wc -l)" \
+    "$PYTHON_BIN" - <<'RUN_HEADER_PY'
+import os
+import sys
+
+W = 88
+
+def line(label, text):
+    print(f"{label:<14}: {text}" if label else f"{'':<14}  {text}")
+
+print("=" * W)
+print(f"nanochat experiment: {os.environ['RUN_ID']}")
+print("=" * W)
+
+try:
+    import contextlib
+    import io
+
+    import torch
+    import nanochat.flash_attention as fa
+    from nanochat.common import COMPUTE_DTYPE, COMPUTE_DTYPE_REASON
+    from nanochat.gpt import GPT, GPTConfig
+    from nanochat.tokenizer import get_tokenizer
+
+    depth = int(os.environ["DEPTH"])
+    head_dim = int(os.environ["HEAD_DIM"])
+    seq_len = int(os.environ["MAX_SEQ_LEN"])
+    pattern = os.environ["WINDOW_PATTERN"]
+    base_dim = depth * int(os.environ["ASPECT_RATIO"])
+    model_dim = ((base_dim + head_dim - 1) // head_dim) * head_dim
+    n_head = model_dim // head_dim
+    vocab = get_tokenizer().get_vocab_size()
+
+    # attention backend actually in force
+    impl = fa.impl_name()
+    if impl == "fa4":
+        import flash_attn_4.fa3_compat as fa4
+        desc = "FA4 (vendored flash_attn_4, CuTe SM120 kernels)"
+        desc += (" via torch.library custom ops" if fa4.has_custom_op()
+                 else " called directly -- WARNING: breaks torch.compile graphs")
+    elif impl == "fa3":
+        desc = "FA3 (kernels hub)"
+    else:
+        desc = "PyTorch SDPA (sliding-window layers build an explicit mask)"
+    line("Attention", desc)
+    line("", f"HAS_FA3={fa.HAS_FA3} HAS_FA4={fa.HAS_FA4} "
+             f"NANOCHAT_ATTN={os.environ.get('NANOCHAT_ATTN', 'auto')}")
+    line("", f"compute dtype {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
+    line("", "inference / KV-cache path always uses SDPA (FA4 has no kvcache entry point)")
+
+    # model + per-layer windows, built on meta so this costs no memory
+    cfg = GPTConfig(sequence_len=seq_len, vocab_size=vocab, n_layer=depth,
+                    n_head=n_head, n_kv_head=n_head, n_embd=model_dim,
+                    window_pattern=pattern)
+    with torch.device("meta"):
+        model = GPT(cfg)
+    windows = [w for w, _ in model.window_sizes]
+    n_short = sum(1 for w in windows if w < seq_len)
+    short_w = min(windows) if n_short else seq_len
+    line("Model", f"depth {depth}, model_dim {model_dim}, {n_head} heads x {head_dim}, "
+                  f"seq_len {seq_len}, vocab {vocab:,}")
+    line("Attn layout", f"window_pattern {pattern} -> {n_short} sliding-window layers "
+                        f"({short_w} tokens) + {len(windows) - n_short} full-context layers")
+    line("", " ".join(f"L{i:02d}:{'S' if w < seq_len else 'L'}{w}" for i, w in enumerate(windows)))
+
+    # optimizer composition
+    with contextlib.redirect_stdout(io.StringIO()):
+        opt = model.setup_optimizer(
+            unembedding_lr=float(os.environ["UNEMBEDDING_LR"]),
+            embedding_lr=float(os.environ["EMBEDDING_LR"]),
+            scalar_lr=float(os.environ["SCALAR_LR"]),
+            matrix_lr=float(os.environ["MATRIX_LR"]),
+            weight_decay=float(os.environ["WEIGHT_DECAY"]),
+        )
+    kinds = {}
+    for g in opt.param_groups:
+        n = sum(p.numel() for p in g["params"])
+        k = kinds.setdefault(g["kind"], {"tensors": 0, "params": 0, "lrs": []})
+        k["tensors"] += len(g["params"])
+        k["params"] += n
+        k["lrs"].append(g["lr"])
+    line("Optimizer", f"{type(opt).__name__} -- Muon on the transformer matrices, "
+                      "AdamW on embeddings and scalars")
+    for kind, k in kinds.items():
+        lrs = ", ".join(str(x) for x in sorted({round(x, 6) for x in k["lrs"]}))
+        line("", f"{kind:5s} {k['tensors']:3d} tensors, {k['params']:>12,} params, lr {lrs}")
+    line("", f"muon weight_decay {os.environ['WEIGHT_DECAY']} (cosine-decayed to 0), "
+             "momentum 0.85 -> 0.97 -> 0.90")
+    line("", "these LRs are pre-scaling; base_train rescales by sqrt(B/B_ref) below")
+    line("Parameters", ", ".join(f"{k} {v:,}" for k, v in model.num_scaling_params().items()))
+except Exception as e:  # a broken header must never block a run
+    print(f"(run header incomplete: {type(e).__name__}: {e})")
+
+line("Data", f"{os.environ.get('NANOCHAT_DATA_DIR')} -- {os.environ['NUM_SHARDS']} shards "
+             "(all but the last are train, the last is val)")
+dbs, tbs = int(os.environ["DEVICE_BATCH_SIZE"]), int(os.environ["TOTAL_BATCH_SIZE"])
+msl, nproc = int(os.environ["MAX_SEQ_LEN"]), int(os.environ["NPROC_PER_NODE"])
+micro = dbs * msl * nproc
+line("Batch", f"{dbs} x {msl} x {nproc} rank(s) = {micro:,} tok/micro-batch, "
+              f"{tbs:,} tok/step -> grad accum {tbs // micro if micro else '?'}")
+ni = int(os.environ["NUM_ITERATIONS"])
+line("Horizon", f"num_iterations {ni}" if ni > 0 else
+                f"target_param_data_ratio {os.environ['TARGET_PARAM_DATA_RATIO']} "
+                "(iteration count computed by base_train below)")
+try:
+    import torch
+    gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+    line("Environment", f"python {sys.version.split()[0]}, torch {torch.__version__}, {gpu}, "
+                        f"git {os.environ['GIT_SHA']} ({os.environ['GIT_DIRTY']} dirty files)")
+except Exception:
+    pass
+print("=" * W)
+print()
+RUN_HEADER_PY
 }
 
 # re-parse an existing run folder and exit
@@ -434,9 +572,11 @@ if [ "${DRY_RUN:-0}" = "1" ]; then
     exit 0
 fi
 
+write_run_header 2>&1 | tee "$RUN_DIR/train.log"
+
 START_TIME=$(date +%s)
 set +e
-"${LAUNCH[@]}" "${TRAIN_ARGS[@]}" 2>&1 | tee "$RUN_DIR/train.log"
+"${LAUNCH[@]}" "${TRAIN_ARGS[@]}" 2>&1 | tee -a "$RUN_DIR/train.log"
 TRAIN_STATUS=${PIPESTATUS[0]}
 set -e
 TRAIN_SECONDS=$(( $(date +%s) - START_TIME ))
