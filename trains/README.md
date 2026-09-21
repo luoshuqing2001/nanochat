@@ -121,6 +121,48 @@ after killing a run early):
 bash trains/train_d12_hybrid_swa_muon.sh --summarize logs/<run_id>
 ```
 
+### Another machine (1x B200 / B300, or any fresh box)
+
+```bash
+git clone <your fork> && cd nanochat && git checkout lsq/residuals
+bash trains/setup_env.sh              # check everything, install nothing
+INSTALL=1 bash trains/setup_env.sh    # also pip install the missing python packages
+```
+
+`setup_env.sh` checks the driver, that this torch build has kernels for the GPU's
+compute-capability family, every python package nanochat and FA4 need, the tokenizer
+and data shards, and which attention backend resolves. It deliberately does **not**
+install torch -- pick the wheel for your CUDA first, e.g.
+`pip install --index-url https://download.pytorch.org/whl/cu130 torch`.
+
+Two assets do not come from git: the tokenizer (`$NANOCHAT_BASE_DIR/tokenizer`, two
+files under 1 MB -- copy it to reproduce runs exactly, or retrain with
+`python -m scripts.tok_train`) and the ClimbMix shards (copy them, or
+`python -m nanochat.dataset -n 200`, then point `NANOCHAT_DATA_DIR` at them). The FA4
+kernels *do* come from git, because they are vendored in `flash_attn_4/`.
+
+What changes on Blackwell datacenter parts (B200 sm100, B300 sm103):
+
+- FA4 dispatches on `arch // 10`, so every 10.x GPU gets the **native SM100 kernels**
+  (`flash_fwd_sm100.py`), not the SM80-derived SM120 ones this box uses. There is no
+  sm103 special case, and the SM100 path is the one upstream optimizes hardest.
+- FP8 becomes available: FA4 asserts `arch // 10 == 10` for FP8 attention, and
+  nanochat's own `--fp8` (Float8Linear for the matmuls) targets H100+. Both are worth
+  an A/B; pass `--fp8` through the launcher.
+- FA3 may resolve too (the kernels hub has more coverage for sm90/sm100). The resolver
+  prefers FA3 when present, which may not be what you want -- compare all three with
+  `NANOCHAT_ATTN=fa3|fa4|sdpa python trains/bench_attention.py`.
+- Memory is discrete HBM, not unified, so the page-cache contention that kills
+  `DEVICE_BATCH_SIZE=64` here does not apply. With 180-288 GB, start at 64 and try
+  128; it must stay a power of two dividing `TOTAL_BATCH_SIZE / MAX_SEQ_LEN`.
+- `get_peak_flops()` in `nanochat/common.py` has entries for b100/b200/gb200 but not
+  b300, so MFU prints 0.00 until you add one with the official dense BF16 number.
+- d12 is small for such a GPU. The launcher is generic: `DEPTH=20 bash trains/...`
+  re-derives model dim, batch size, horizon and LR scaling.
+
+Then the usual order: `DRY_RUN=1`, `SMOKE=1`, `python trains/bench_attention.py` to
+pick the backend and micro-batch, and only then the real run.
+
 ### Notes for this machine (1x NVIDIA GB10)
 
 - FA3 has no sm121 kernels. Attention runs on the vendored FA4 CuTe kernels
