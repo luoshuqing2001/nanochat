@@ -66,6 +66,37 @@ WARMUP_STEPS, WARMDOWN_RATIO, NUM_ITERATIONS, TARGET_PARAM_DATA_RATIO, EVAL_EVER
 EVAL_TOKENS, SAMPLE_EVERY, SAVE_EVERY, CORE_METRIC_EVERY, FINAL_EVAL, WANDB_RUN,
 NPROC_PER_NODE, PYTHON_BIN, NANOCHAT_BASE_DIR`.
 
+### Model internals
+
+base_train.py logs loss and throughput only. `nanochat/diagnostics.py` adds the
+internals, sampled every `DIAGNOSTICS_EVERY` steps (default 50, `-1` disables):
+
+- gradient L2 norms: global, per optimizer kind (Muon / AdamW), and per layer
+- update-to-parameter ratios `||dw||/||w||` per kind -- the standard Muon tuning
+  signal, healthy around 1e-3
+- attention log-sum-exp per layer (flash kernels never materialize the logits, so
+  LSE is the cheap upper bound: `max_logit <= lse <= max_logit + log(n_keys)`), plus
+  the exact max logit recomputed on a 128-query subsample
+- per-layer activation RMS (residual stream, attention output, MLP output) and the
+  learnable residual scalars `resid_lambdas` / `x0_lambdas`
+
+Each sample prints a human-readable `diag <step> | ...` line plus a `diag_json {...}`
+line that the log parser turns into `{"type": "diag", ...}` records in `metrics.jsonl`;
+`summary.md` shows the last sample. Activations and attention logits come from one
+extra no-grad forward on the *uncompiled* model, so the compiled training graph is
+never instrumented; the gradient and update statistics are the only part inside the
+timed region, which slightly inflates `dt` on diagnostic steps.
+
+The same statistics can be computed offline, on any checkpoint (including runs that
+predate this and other experiments' checkpoints):
+
+```bash
+python trains/probe_checkpoint.py --model-tag <run_id> --steps 500,1000 --out probe.json
+```
+
+That one does a real backward on a fixed validation batch, so it also reports per-layer
+gradient norms. It needs the GPU -- do not run it next to a live training job.
+
 ### What lands in logs/<run_id>/
 
 | file | contents |

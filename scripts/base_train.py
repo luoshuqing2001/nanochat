@@ -31,6 +31,7 @@ from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, p
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
+from nanochat import diagnostics
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
@@ -74,6 +75,7 @@ parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number o
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
+parser.add_argument("--diagnostics-every", type=int, default=-1, help="log model internals (grad norms, update:param ratios, attention logits/LSE, activation RMS, residual scalars) every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
@@ -403,6 +405,9 @@ else:
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
 
+# Diagnostics (model internals); the tracker only holds memory on diagnostic steps
+update_tracker = diagnostics.UpdateTracker()
+
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
@@ -525,6 +530,13 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+    # Diagnostics: gradients have to be read before the step, weights cloned before it too.
+    # This runs inside the timed region, so dt is slightly inflated on diagnostic steps.
+    run_diagnostics = args.diagnostics_every > 0 and step % args.diagnostics_every == 0
+    diag_stats = {}
+    if run_diagnostics:
+        diag_stats.update(diagnostics.grad_norms(orig_model, optimizer))
+        update_tracker.snapshot(optimizer)
     if scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.
@@ -537,6 +549,8 @@ while True:
         scaler.update()
     else:
         optimizer.step()
+    if run_diagnostics:
+        diag_stats.update(update_tracker.ratios(optimizer))
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
@@ -565,6 +579,15 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    if run_diagnostics:
+        # Activations and attention logits come from an extra no-grad forward on the
+        # uncompiled model, so the compiled training graph is never instrumented.
+        with disable_fp8(orig_model):
+            diag_stats.update(diagnostics.activation_report(orig_model, x))
+        print0(diagnostics.format_line(step, diag_stats))
+        print0(diagnostics.format_json(step, diag_stats))
+        wandb_run.log({"step": step, **{f"diag/{k}": v for k, v in diag_stats.items()
+                                        if isinstance(v, (int, float))}})
     if step % 100 == 0:
         log_data = {
             "step": step,

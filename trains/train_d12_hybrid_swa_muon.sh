@@ -110,6 +110,12 @@ with open(train_log, errors="replace") as f:
                 params[m.group(1)] = int(m.group(2).replace(",", ""))
                 continue
             in_params = False
+        if line.startswith("diag_json "):
+            try:
+                records.append(json.loads(line[len("diag_json "):]))
+            except json.JSONDecodeError:
+                pass
+            continue
         m = STEP_RE.search(line)
         if m:
             records.append({"type": "train", "step": int(m.group(1)), "num_iterations": int(m.group(2)),
@@ -211,6 +217,19 @@ for k, label in [("final_train_loss_ema", "final train loss (EMA)"), ("final_val
                  ("eval_train_bpb", "train bpb (base_eval)"), ("eval_core_metric", "CORE metric (base_eval)")]:
     if k in summary:
         L.append(f"- {label}: {fmt(summary[k])}")
+diag_recs = [r for r in records if r.get("type") == "diag"]
+if diag_recs:
+    last = diag_recs[-1]
+    L += ["", f"## Diagnostics (last sample, step {last.get('step')}; {len(diag_recs)} samples in metrics.jsonl)", ""]
+    for k in ("grad_norm/global", "grad_norm/muon", "grad_norm/adamw",
+              "update_ratio/muon", "update_ratio/adamw",
+              "attn_logit/max/max", "attn_lse/max/max",
+              "act_rms/block/min", "act_rms/block/max",
+              "scalars/resid_lambdas/min", "scalars/resid_lambdas/max",
+              "scalars/x0_lambdas/min", "scalars/x0_lambdas/max"):
+        if k in last:
+            L.append(f"- {k}: {last[k]:.6g}")
+
 L += ["", "## Throughput", ""]
 for k, label in [("gpu", "GPU"), ("compute_dtype", "compute dtype"), ("data_dir", "data dir"),
                  ("median_dt_ms", "median step time (ms)"), ("median_tok_per_sec", "median tokens/sec"),
@@ -237,6 +256,7 @@ write_run_header() {
     UNEMBEDDING_LR="$UNEMBEDDING_LR" SCALAR_LR="$SCALAR_LR" \
     NUM_ITERATIONS="$NUM_ITERATIONS" TARGET_PARAM_DATA_RATIO="$TARGET_PARAM_DATA_RATIO" \
     NPROC_PER_NODE="$NPROC_PER_NODE" NUM_SHARDS="$NUM_SHARDS" \
+    DIAGNOSTICS_EVERY="$DIAGNOSTICS_EVERY" \
     GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
     GIT_DIRTY="$(git status --porcelain 2>/dev/null | wc -l)" \
     "$PYTHON_BIN" - <<'RUN_HEADER_PY'
@@ -331,6 +351,8 @@ try:
 except Exception as e:  # a broken header must never block a run
     print(f"(run header incomplete: {type(e).__name__}: {e})")
 
+line("Diagnostics", f"model internals every {os.environ.get('DIAGNOSTICS_EVERY', '-1')} steps "
+                    "(grad norms, update:param, attention logits/LSE, activation RMS, residual scalars)")
 line("Data", f"{os.environ.get('NANOCHAT_DATA_DIR')} -- {os.environ['NUM_SHARDS']} shards "
              "(all but the last are train, the last is val)")
 dbs, tbs = int(os.environ["DEVICE_BATCH_SIZE"]), int(os.environ["TOTAL_BATCH_SIZE"])
@@ -403,6 +425,10 @@ EVAL_TOKENS="${EVAL_TOKENS:-2097152}"
 SAMPLE_EVERY="${SAMPLE_EVERY:-1000}"
 SAVE_EVERY="${SAVE_EVERY:-500}"
 CORE_METRIC_EVERY="${CORE_METRIC_EVERY:--1}"     # needs the eval_bundle download, off by default
+# model internals: grad norms, update:param ratios, attention logits/LSE, activation RMS,
+# residual scalars. Costs one extra no-grad forward on the uncompiled model, so at 50 it
+# is well under 1% of the run. -1 disables.
+DIAGNOSTICS_EVERY="${DIAGNOSTICS_EVERY:-50}"
 
 # post-training evaluation ("none" to skip); add ",core" to also run CORE
 FINAL_EVAL="${FINAL_EVAL:-bpb,sample}"
@@ -418,6 +444,7 @@ if [ "${SMOKE:-0}" = "1" ]; then                 # quick pipeline check
     EVAL_TOKENS=$((DEVICE_BATCH_SIZE * MAX_SEQ_LEN * NPROC_PER_NODE * 4))
     SAMPLE_EVERY=-1
     SAVE_EVERY=-1
+    DIAGNOSTICS_EVERY="${SMOKE_DIAGNOSTICS_EVERY:-5}"
     FINAL_EVAL="none"
     RUN_NAME="${RUN_NAME:-d${DEPTH}_hybridswa_muon_smoke}"
 fi
@@ -512,6 +539,7 @@ cat > "$RUN_DIR/config.json" <<JSON
   "sample_every": $SAMPLE_EVERY,
   "save_every": $SAVE_EVERY,
   "core_metric_every": $CORE_METRIC_EVERY,
+  "diagnostics_every": $DIAGNOSTICS_EVERY,
   "final_eval": "$FINAL_EVAL",
   "nproc_per_node": $NPROC_PER_NODE,
   "wandb_run": "$WANDB_RUN",
@@ -545,6 +573,7 @@ TRAIN_ARGS=(
     --sample-every="$SAMPLE_EVERY"
     --save-every="$SAVE_EVERY"
     --core-metric-every="$CORE_METRIC_EVERY"
+    --diagnostics-every="$DIAGNOSTICS_EVERY"
     --model-tag="$RUN_ID"
     --run="$WANDB_RUN"
 )
