@@ -169,6 +169,29 @@ is what the runs in `logs/` used) and refuses a budget that would run past it.
 shard, and without `--yes` it only reports. ClimbMix ships pre-shuffled
 ("climbmix-400b-shuffle"), so keeping a contiguous prefix is an unbiased sample.
 
+### Runs longer than one container
+
+Modal caps a function call at 24 h, so anything past a day has to survive a restart.
+base_train restores model, optimizer and dataloader position from a checkpoint, and
+`trains/resume_latest.sh` finds the newest one and relaunches:
+
+```bash
+bash trains/resume_latest.sh d24_hybridswa_muon_20260921_120000 --keep 2
+```
+
+It infers the size wrapper from the run id, checks that the step it picks has its
+optimizer shard (a half-written checkpoint from a killed container is skipped rather
+than loaded), and `--keep N` drops older checkpoints first -- necessary because
+nanochat never prunes them and a d24 checkpoint is ~9 GB.
+
+The environment is *not* stored in the checkpoint, so a resume must re-export what
+the original run used (`MUON_VARIANT`, `TARGET_PARAM_DATA_RATIO`, `NANOCHAT_DATA_DIR`,
+...). `logs/<run_id>/config.json` records them.
+
+Set `SAVE_EVERY` from how much work a crash may cost, not from how many checkpoints
+look tidy: at ~7.6 s/step for d24 on a B300, `SAVE_EVERY=2000` is a checkpoint every
+~4 h, which bounds the loss from an unexpected restart.
+
 ### Muon variants
 
 `MUON_VARIANT` picks the update rule for the matrix parameters:
