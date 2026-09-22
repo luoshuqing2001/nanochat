@@ -112,6 +112,56 @@ else
 fi
 
 echo
+echo "=== Triton toolchain (needed by ATTN_KIND=softplus) ==="
+"$PYTHON_BIN" - <<'PY'
+import subprocess, sys
+try:
+    import torch, triton, os
+except Exception as e:
+    print(f"  {'triton':<28} FAIL  not importable: {e}")
+    raise SystemExit(0)
+print(f"  {'triton':<28} OK    {triton.__version__}")
+if not torch.cuda.is_available():
+    raise SystemExit(0)
+cap = torch.cuda.get_device_capability()
+arch = f"sm_{cap[0]}{cap[1]}a"
+ptxas = os.path.join(os.path.dirname(triton.__file__), "backends/nvidia/bin/ptxas")
+if not os.path.exists(ptxas):
+    print(f"  {'ptxas':<28} WARN  not at {ptxas}")
+else:
+    ver = subprocess.run([ptxas, "--version"], capture_output=True, text=True).stdout
+    rel = [l for l in ver.splitlines() if "release" in l]
+    helptext = subprocess.run([ptxas, "--help"], capture_output=True, text=True).stdout
+    ok = arch in helptext
+    print(f"  {'ptxas':<28} {'OK   ' if ok else 'FAIL '} {rel[0].strip() if rel else '?'}")
+    print(f"  {'ptxas knows ' + arch:<28} {'OK' if ok else 'FAIL  this is the sm_103a failure; upgrade torch (triton 3.8 ships CUDA 12.9 ptxas)'}")
+# the real test: compile and run a kernel on this device
+try:
+    import triton.language as tl
+    src = ("import torch, triton, triton.language as tl\n"
+           "@triton.jit\n"
+           "def _k(X, Y, N: tl.constexpr):\n"
+           "    i = tl.arange(0, N)\n"
+           "    tl.store(Y + i, tl.log(1.0 + tl.exp(-tl.abs(tl.load(X + i)))))\n"
+           "x = torch.randn(64, device='cuda'); y = torch.empty_like(x)\n"
+           "_k[(1,)](x, y, N=64); torch.cuda.synchronize(); print('ok')\n")
+    open("/tmp/_triton_probe.py", "w").write(src)
+    r = subprocess.run([sys.executable, "/tmp/_triton_probe.py"], capture_output=True, text=True)
+    good = r.stdout.strip().endswith("ok")
+    print(f"  {'compiles a kernel':<28} {'OK' if good else 'FAIL  ' + r.stderr.strip().splitlines()[-1][:90] if r.stderr else 'FAIL'}")
+except Exception as e:
+    print(f"  {'compiles a kernel':<28} FAIL  {e}")
+# and the real attention kernel end to end
+try:
+    from nanochat.softplus_attention import softplus_attn_func
+    q, k, v = (torch.randn(2, 512, 4, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+    o = softplus_attn_func(q, k, v, window_size=(255, 0))
+    print(f"  {'softplus attention':<28} OK    forward {tuple(o.shape)}")
+except Exception as e:
+    print(f"  {'softplus attention':<28} FAIL  {type(e).__name__}: {str(e)[:80]}")
+PY
+
+echo
 echo "=== attention backend ==="
 "$PYTHON_BIN" - <<'PY'
 import torch

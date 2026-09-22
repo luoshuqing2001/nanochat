@@ -451,7 +451,10 @@ INSTALL=1 bash trains/setup_env.sh    # also pip install the missing python pack
 
 `setup_env.sh` checks the driver, that this torch build has kernels for the GPU's
 compute-capability family, every python package nanochat and FA4 need, the tokenizer
-and data shards, and which attention backend resolves. It deliberately does **not**
+and data shards, which attention backend resolves, and the Triton toolchain that
+`ATTN_KIND=softplus` depends on -- including whether the bundled `ptxas` knows this
+GPU's `sm_XXa`, which is what failed on a B300 (`sm_103a` needs CUDA 12.9, shipped with
+triton 3.8), and whether a kernel actually compiles and runs here. It deliberately does **not**
 install torch -- pick the wheel for your CUDA first, e.g.
 `pip install --index-url https://download.pytorch.org/whl/cu130 torch`.
 
