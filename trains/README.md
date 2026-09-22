@@ -247,9 +247,12 @@ scaling law across them.
 
 | | params | tokens | tok/param | steps | wall clock (1x B200) |
 |---|---|---|---|---|---|
-| d12 ablation | 286M | 15.0B | 52 | 28,560 | ~3.4 h |
-| d16 ablation | 537M | 15.0B | 28 | 28,672 | ~7.1 h |
+| d12 ablation | 286M | 12.0B | 42 | 22,890 | ~2.7 h |
+| d16 ablation | 537M | 12.0B | 22 | 22,848 | ~5.6 h |
 | d20 headline | 897M | 60.1B | 67 | 57,270 | ~51 h |
+
+Both arms of every size, so six runs: ~17 h for the ablation tier and ~102 h for the
+headline pair on one B200, or roughly a day and a half on eight.
 
 What has to hold is that **both arms at a given size see the same budget** -- hence the
 files, rather than exports typed by hand. What this design does not support is a precise

@@ -7,14 +7,14 @@
 #   RESUME=<run_id> bash trains/exp_d16_ctrl.sh        # continue after a restart
 #   DRY_RUN=1 bash trains/exp_d16_ctrl.sh              # print the config, do not train
 #
-# The token budget is an absolute 15.0B, not a ratio carried over from the d20 run.
+# The token budget is an absolute 12.0B, not a ratio carried over from the d20 run.
 # That follows what the architecture literature actually does: a cheap fixed config for
 # the ablation sweep and a separate, larger one for the headline result -- 340M/15B and
 # 1.3B/100B in GLA, Gated Slot Attention and the DeltaNet line, 600M/15B and 2B/100B
 # elsewhere. Those two tiers do not share a tokens-per-parameter ratio (44 vs 77), and
 # no one fits a scaling law across them; each tier is compared within itself.
 #
-# So: 15.0B here (28 tokens/param, ~28,672 steps, about 7.1 h on one B200 at the
+# So: 12.0B here (22 tokens/param, ~22,848 steps, about 5.6 h on one B200 at the
 # 937 TFLOPS measured there) against 60B for d20. What must hold is that both arms at
 # *this* size see the same budget, which is why it is pinned here rather than exported
 # by hand. What this tier cannot support is a precise claim about how an effect scales
@@ -31,11 +31,11 @@ unset NUM_ITERATIONS RUN_NAME TARGET_FLOPS 2>/dev/null || true
 export MUON_VARIANT="${MUON_VARIANT:-moonlight}"
 export FP8="${FP8:-1}"
 export FP8_RECIPE="${FP8_RECIPE:-tensorwise}"
-export TARGET_PARAM_DATA_RATIO="${TARGET_PARAM_DATA_RATIO:-64}"   # 15.0B tokens
+export TARGET_PARAM_DATA_RATIO="${TARGET_PARAM_DATA_RATIO:-51}"   # 12.0B tokens
 export DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-64}"
-export SAVE_EVERY="${SAVE_EVERY:-10000}"
-export EVAL_EVERY="${EVAL_EVERY:-2000}"
-export DIAGNOSTICS_EVERY="${DIAGNOSTICS_EVERY:-500}"
+export SAVE_EVERY="${SAVE_EVERY:-5000}"
+export EVAL_EVERY="${EVAL_EVERY:-1000}"
+export DIAGNOSTICS_EVERY="${DIAGNOSTICS_EVERY:-250}"
 
 if [ -n "${RESUME:-}" ]; then
     exec bash trains/resume_latest.sh "$RESUME" --keep 2 "$@"
