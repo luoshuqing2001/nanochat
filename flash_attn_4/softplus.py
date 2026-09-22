@@ -23,6 +23,7 @@
 # contribute to an unnormalized sum -- so softplus needs no separate masked-entry path.
 
 import math
+import os
 from dataclasses import dataclass
 
 import cutlass
@@ -35,6 +36,17 @@ from quack.cute_dsl_utils import ParamsBase
 LOG2_E = math.log2(math.e)
 LN2 = math.log(2.0)
 
+# log1p(y) for y in [0, 1], as y * poly(y): a degree-5 minimax fit whose maximum absolute
+# error is 1.3e-5. bf16's resolution near ln2 is 2.7e-3, 200x coarser, so this is not an
+# approximation of the architecture -- it is the same function to every bit that survives
+# the cast into the PV matmul. It exists because the exact form needs a second
+# transcendental, and that one log2 costs 4-7% of the forward (see VENDOR.md).
+_LOG1P_COEFFS = (
+    0.999981869, -0.499187794, 0.324411505, -0.208668975, 0.10028652, -0.0236890026,
+)
+# FA4_SOFTPLUS_EXACT=1 goes back to log2(1 + exp2(...)) for a reference run.
+_USE_POLY = os.environ.get("FA4_SOFTPLUS_EXACT", "0") != "1"
+
 
 @cute.jit
 def softplus_(x: cute.TensorSSA, zero: cute.TensorSSA) -> cute.TensorSSA:
@@ -45,9 +57,17 @@ def softplus_(x: cute.TensorSSA, zero: cute.TensorSSA) -> cute.TensorSSA:
     version, so the caller materializes it from a zeroed rmem fragment instead.
     """
     abs_x = cute.math.abs(x, fastmath=True)
-    return cute.math.max(x, zero) + cute.math.log2(
-        1.0 + cute.math.exp2(abs_x * (-LOG2_E), fastmath=True), fastmath=True
-    ) * LN2
+    # y = exp(-|x|) in (0, 1]; at a masked -inf entry y is 0 and the whole thing is 0.
+    y = cute.math.exp2(abs_x * (-LOG2_E), fastmath=True)
+    if cutlass.const_expr(_USE_POLY):
+        c0, c1, c2, c3, c4, c5 = _LOG1P_COEFFS
+        poly = c4 + y * c5
+        poly = c3 + y * poly
+        poly = c2 + y * poly
+        poly = c1 + y * poly
+        poly = c0 + y * poly
+        return cute.math.max(x, zero) + y * poly
+    return cute.math.max(x, zero) + cute.math.log2(1.0 + y, fastmath=True) * LN2
 
 
 @dataclass

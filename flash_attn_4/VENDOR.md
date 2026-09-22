@@ -180,10 +180,49 @@ use for -- cheaper than recomputing the row index in the kernel.
 | Triton softplus | 1.274 ms | 2.223 ms |
 | **CuTe softplus** | **1.091 ms** | **1.703 ms** |
 
-1.17x over the Triton kernel on windowed layers and 1.31x on full-causal ones. On the
-full-causal layer it also beats FA4's own *softmax* by 1.16x, which is the point:
-dropping the running max, the running sum and the per-tile rescale of the accumulator
-is worth about that much.
+1.17x over the Triton kernel on windowed layers and 1.31x on full-causal ones.
+
+(An earlier revision of this file claimed 1.16x over FA4's own *softmax* on the
+full-causal forward. That came from a single noisy run whose softmax reading was 1.978
+ms; a median of five puts softmax at 1.638 and the exact softplus at 1.665, i.e.
+softplus's forward was 2% **slower**. What follows is why, and what fixed it.)
+
+### The second transcendental, and getting rid of it
+
+Dropping the normalisation removes the running max, the running sum and the per-tile
+rescale of the accumulator -- all per row or per tile. But the stable softplus form
+costs an extra transcendental *per score element*: softmax evaluates one `exp2`, and
+`max(s,0) + ln2*log2(1 + exp2(-|s|*log2e))` evaluates `exp2` **and** `log2`. Swapping
+the score map for progressively cheaper ones prices each part (B8 T2048 H12 / B1 T8192
+H12, forward, median of five, against softmax at 1.638 / 3.018 ms):
+
+| score map | transcendentals | time | vs softmax |
+|---|---|---|---|
+| relu, `max(x, 0)` | 0 | 1.520 / 2.772 | 1.095x / 1.083x |
+| `exp2(x)` alone | 1 | 1.529 / 2.754 | 1.074x / 1.095x |
+| `max(x,0) + exp2(-|x|)` | 1 | 1.600 / 2.914 | 1.025x / 1.039x |
+| exact softplus | 2 | 1.665 / 3.125 | 0.984x / 0.966x |
+
+So the structural win is real and worth about 1.09x -- and the single `log2` was
+spending all of it.
+
+It can be removed without approximating the architecture. Write the correction term in
+`y = exp(-|x|)` rather than in `x`:
+
+    softplus(x) = max(x, 0) + log1p(y),   y = exp(-|x|) in (0, 1]
+
+`y` is bounded to the unit interval by construction, where `log1p` is smooth, so a
+degree-5 minimax polynomial in `y` holds a maximum absolute error of **1.3e-5**. bf16's
+resolution near ln2 is 2.7e-3, 200x coarser, so what reaches the PV matmul is bit-for-bit
+what the exact form produced: the correctness tests report exactly the same 3.104e-03
+and 3.875e-03 against the float32 reference either way. One `log2` becomes five FMAs:
+
+| | B8 T2048 H12 | B1 T8192 H12 |
+|---|---|---|
+| exact `log2` | 1.684 ms, 0.973x | 3.111 ms, 0.965x |
+| **degree-5 polynomial** | **1.586 ms, 1.034x** | **2.923 ms, 1.028x** |
+
+`FA4_SOFTPLUS_EXACT=1` restores the `log2` form for a reference run.
 
 ### Does softplus actually make training faster? Barely.
 
@@ -206,16 +245,18 @@ With the backward in CuTe as well (same shape, re-measured in one run):
 | | fwd | bwd | fwd+bwd |
 |---|---|---|---|
 | **S, window 512** | | | |
-| FA4 softmax | 1.120 | 4.789 | 5.909 ms |
-| Triton softplus | 1.286 | 4.001 | 5.288 ms |
-| CuTe softplus | 1.043 | 4.415 | 5.458 ms |
+| FA4 softmax | 1.071 | 4.654 | 5.725 ms |
+| Triton softplus | 1.286 | 3.923 | 5.209 ms |
+| CuTe softplus | 1.058 | 4.280 | 5.338 ms |
 | **L, full causal** | | | |
-| FA4 softmax | 1.670 | 6.883 | 8.553 ms |
-| Triton softplus | 2.179 | 7.230 | 9.409 ms |
-| CuTe softplus | 1.720 | 6.534 | **8.253 ms** |
+| FA4 softmax | 1.640 | 6.953 | 8.593 ms |
+| Triton softplus | 2.155 | 7.273 | 9.428 ms |
+| CuTe softplus | 1.580 | 6.816 | **8.396 ms** |
 
-Over an SSSL mix that is 26.28 -> 24.63 ms against FA4 softmax, **1.07x on attention**,
-or 1.09x if each layer type takes its best backward (Triton for windowed, CuTe for full).
+Over an SSSL mix that is 25.77 -> 24.41 ms against FA4 softmax, **1.06x on attention**,
+or 1.08x if each layer type takes its best backward (Triton for windowed, CuTe for full).
+The polynomial buys 6% of the forward but the backward is four fifths of this total, so
+it barely shows here; where it shows is inference, which is forward only.
 Attention is ~12% of a d12/bs32 step on GB10, so ~1% end to end -- which matches the
 earlier end-to-end A/B, 45,179 tok/s for Triton softplus against 44,982 for FA4 softmax.
 
@@ -351,6 +392,7 @@ GB10; the s= columns are uniform splitting for comparison:
 | | s=1 | s=2 | s=4 | s=8 | auto (balanced) |
 |---|---|---|---|---|---|
 | prefill H1 T4096 | 0.181 | 0.123 | 0.127 | 0.128 | chunk 11, **1.84x** |
+
 | prefill H1 T8192 | 0.447 | 0.346 | 0.321 | 0.342 | chunk 43, 1.49x |
 | prefill H1 T16384 | 1.334 | 1.106 | 1.077 | 1.101 | chunk 172, 1.16x |
 | prefill H12 T8192 | 3.153 | 3.440 | 3.648 | 4.092 | none, 0.99x |
@@ -364,6 +406,27 @@ handful of programs on 48 SMs, and splitting the key range is the only paralleli
 available. Multi-head prefill already fills the machine and `auto` correctly declines.
 The heuristic lands within a few percent of the per-shape optimum everywhere; it is
 tuned on one GPU, so re-check the constants in `softplus_api.py` on other hardware.
+
+### Against softmax, at inference shapes
+
+The comparison that decides whether to serve with it. Softmax cannot use the balanced
+schedule at all, so this is where dropping the normalisation buys something real rather
+than a fraction of a percent. Forward only, GB10, `num_splits="auto"`:
+
+| | FA4 softmax | CuTe softplus | |
+|---|---|---|---|
+| prefill H1 T4096 | 0.175 ms | 0.099 ms | **1.76x** |
+| prefill H1 T8192 | 0.433 ms | 0.309 ms | 1.40x |
+| prefill H12 T8192 | 3.025 ms | 2.947 ms | 1.03x |
+| decode H6 Tk4096 | 0.173 ms | 0.032 ms | **5.45x** |
+| decode H6 Tk16384 | 0.706 ms | 0.233 ms | 3.03x |
+| decode H6 Tk65536 | 2.893 ms | 0.940 ms | 3.08x |
+| decode H6 Tk131072 | 5.425 ms | 1.764 ms | **3.08x** |
+| decode H12 Tk65536 | 2.777 ms | 1.778 ms | 1.56x |
+
+Multi-head prefill is the one shape with no headroom in either mechanism: 768 CTAs on
+48 SMs is 16 waves deep, so the balanced scheduler correctly declines, and all that is
+left is the score map. Before the polynomial it was 0.95x; now it is 1.03x.
 
 ### Side effect: upstream's SWA forward was ignoring the window's lower bound
 
