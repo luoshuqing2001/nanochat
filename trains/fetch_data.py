@@ -10,12 +10,25 @@ This script sizes the download from the model instead, and pins the validation s
 
     python trains/fetch_data.py --depth 24              # compute-optimal d24, 25% margin
     python trains/fetch_data.py --depth 24 --dry-run    # just the plan
-    python trains/fetch_data.py --tokens 20e9           # explicit token budget
-    python trains/fetch_data.py --depth 24 --prune --yes   # also delete surplus shards
+    python trains/fetch_data.py --tokens 100e9          # explicit token budget
+    python trains/fetch_data.py --tokens 100e9 --epochs 4   # allow 4 passes over the data
+    python trains/fetch_data.py --depth 24 --prune --yes    # also delete surplus shards
 
 How the sizing works:
   tokens needed = 12 x scaling_params(depth)   (the data:param ratio base_train targets)
-  shards        = ceil(tokens x margin / 44.8e6)
+  unique tokens = tokens / epochs              (see --epochs)
+  shards        = ceil(unique tokens x margin / 44.8e6)
+
+--depth sizes a compute-optimal run. Architecture ablations at ~1B usually want far
+more than that: the standard setup in the linear/efficient-attention literature is a
+1.3B model on 100B tokens (GLA, DeltaNet, Gated Slot Attention, Gated DeltaNet-2,
+Physics of LMs 4.1), which is ~77 tokens/param rather than 12. Pass --tokens for that.
+
+--epochs trades storage for data reuse. Muennighoff et al., "Scaling Data-Constrained
+Language Models" (NeurIPS 2023), found up to ~4 epochs of repeated data costs
+negligible loss compared with fresh tokens, so a 100B-token run can be fed from 25B
+unique tokens at a quarter of the disk. nanochat's dataloader cycles automatically and
+reports the epoch in the training log.
 
 44.8M tokens/shard is measured, not assumed: the finished d12 run consumed
 2,520 x 524,288 = 1.321B tokens and ended at parquet 29, row group 43 of 84, i.e.
@@ -58,6 +71,9 @@ def main():
     g.add_argument("--depth", type=int, help="size the download for a compute-optimal run at this depth")
     g.add_argument("--tokens", type=float, help="explicit token budget, e.g. 20e9")
     ap.add_argument("--margin", type=float, default=1.25, help="safety factor over the computed need (default 1.25)")
+    ap.add_argument("--epochs", type=int, default=1,
+                    help="how many passes over the data the run may take (default 1). Up to ~4 costs "
+                         "almost nothing in loss (Muennighoff et al. 2023) and divides the disk need.")
     ap.add_argument("--val-shard", type=int, default=2499,
                     help="shard index reserved as the validation set; must stay the highest kept index (default 2499)")
     ap.add_argument("--workers", type=int, default=4)
@@ -77,9 +93,16 @@ def main():
         tokens = args.tokens
         print(f"requested budget: {tokens/1e9:.2f}B tokens")
 
-    need = tokens * args.margin
+    if args.epochs < 1:
+        print("ERROR: --epochs must be >= 1", file=sys.stderr)
+        return 1
+    unique = tokens / args.epochs
+    need = unique * args.margin
     n_train = math.ceil(need / TOKENS_PER_SHARD)
-    print(f"with a {args.margin}x margin: {need/1e9:.2f}B tokens -> {n_train} train shards "
+    if args.epochs > 1:
+        print(f"over {args.epochs} epochs: {unique/1e9:.2f}B unique tokens needed"
+              + ("  (>4 epochs starts to cost measurable loss)" if args.epochs > 4 else ""))
+    print(f"with a {args.margin}x margin: {need/1e9:.2f}B unique tokens -> {n_train} train shards "
           f"(~{n_train * SHARD_MB / 1024:.0f} GB) + 1 validation shard")
 
     if n_train > args.val_shard:

@@ -114,12 +114,39 @@ per shard**. That constant is measured, not assumed -- the finished d12 run cons
 
 | target | tokens | shards | disk |
 |---|---|---|---|
-| d12 | 1.3B | 37 | 3 GB |
-| d16 | 2.8B | 79 | 7 GB |
-| d20 | 5.2B | 146 | 13 GB |
-| d22 (~1.1B params) | 6.8B | 191 | 16 GB |
-| d24 (~1.4B params) | 8.8B | 245 | 21 GB |
-| d32 | 20.1B | 562 | 48 GB |
+| d12 compute-optimal | 1.3B | 37 | 3 GB |
+| d16 compute-optimal | 2.8B | 79 | 7 GB |
+| d20 compute-optimal | 5.2B | 146 | 13 GB |
+| d22 compute-optimal (~1.1B params) | 6.8B | 191 | 16 GB |
+| d24 compute-optimal (~1.4B params) | 8.8B | 245 | 21 GB |
+| **d24 Chinchilla (20 tok/param)** | 26B | 726 | 62 GB |
+| **d24 ablation standard, 4 epochs** | 100B (25B unique) | 698 | 60 GB |
+| **d24 ablation standard, 1 epoch** | 100B | 2791 | 240 GB |
+
+### How many tokens for an architecture ablation?
+
+`--depth` sizes a *compute-optimal* run, which is the wrong target for comparing
+architectures. What the literature does at this scale:
+
+- The de facto standard for efficient-attention architecture papers is **1.3B
+  parameters on 100B tokens** -- [GLA](https://arxiv.org/pdf/2312.06635),
+  [DeltaNet](https://proceedings.neurips.cc/paper_files/paper/2024/file/d13a3eae72366e61dfdc7eea82eeb685-Paper-Conference.pdf),
+  [Gated Slot Attention](https://proceedings.neurips.cc/paper_files/paper/2024/file/d3f39e51f5f634fb16cc3e658f8512b9-Paper-Conference.pdf),
+  [Gated DeltaNet-2](https://arxiv.org/abs/2605.22791),
+  [Physics of LMs 4.1](https://arxiv.org/pdf/2512.17351) all use it. That is ~77
+  tokens/param, six times Chinchilla and six times nanochat's ratio-12 default.
+- It is deliberately over-trained. Architecture rankings are **not stable across token
+  budgets**: scaling curves cross, and an advantage visible at a small budget can
+  vanish or reverse later. Compare only within a matched budget, and treat a cheap
+  screening result as a hypothesis, not a finding.
+- Storage does not have to scale with the budget. [Muennighoff et al., "Scaling
+  Data-Constrained Language Models"](https://arxiv.org/abs/2305.16264) (NeurIPS 2023)
+  found up to ~4 epochs of repeated data costs almost nothing versus fresh tokens, so
+  `--epochs 4` cuts a 100B-token run down to 25B unique tokens on disk.
+
+A workable ladder: screen variants at d12 (1.3B tokens, 7.3 h on GB10), promote
+survivors to d16, and run the claim at d24 with 26B tokens (Chinchilla) or 100B
+(comparable to published numbers).
 
 **Do not use `python -m nanochat.dataset -n N` to top up.** Besides sizing by raw
 shard count, it always also downloads `shard_06542` (upstream's `MAX_SHARD`), which
