@@ -106,9 +106,25 @@ def main():
           f"(~{n_train * SHARD_MB / 1024:.0f} GB) + 1 validation shard")
 
     if n_train > args.val_shard:
-        print(f"\nERROR: {n_train} train shards would run past --val-shard {args.val_shard}, and nanochat "
-              f"takes the highest-numbered shard as validation.\nRaise --val-shard (and accept that val "
-              f"changes, making past runs incomparable), or lower the budget.", file=sys.stderr)
+        budget_arg = f"--depth {args.depth}" if args.depth else f"--tokens {args.tokens:g}"
+        # floor to 2 decimals: rounding up would push the shard count back past the val shard
+        fits_margin = math.floor(args.val_shard * TOKENS_PER_SHARD / tokens * 100) / 100
+        min_epochs = math.ceil(need / (args.val_shard * TOKENS_PER_SHARD))
+        print(f"\nERROR: {n_train} train shards would run past --val-shard {args.val_shard}.", file=sys.stderr)
+        print(f"nanochat validates on the highest-numbered shard, so going past it silently "
+              f"redefines the validation set and makes past runs incomparable.\n", file=sys.stderr)
+        print("Pick one:", file=sys.stderr)
+        if fits_margin > 1.0:
+            n_tight = math.ceil(tokens * min(fits_margin, args.margin) / TOKENS_PER_SHARD)
+            print(f"  a) keep the budget, trim the margin to {fits_margin:.2f} (the budget still fits "
+                  f"below the val shard):\n     python trains/fetch_data.py {budget_arg} "
+                  f"--margin {fits_margin:.2f}   -> {n_tight} shards, ~{n_tight*SHARD_MB/1024:.0f} GB",
+                  file=sys.stderr)
+        print(f"  b) reuse data instead of storing it ({min_epochs} epochs; up to ~4 is nearly free, "
+              f"Muennighoff et al. 2023):\n     python trains/fetch_data.py {budget_arg} "
+              f"--epochs {min_epochs}", file=sys.stderr)
+        print(f"  c) move the validation shard, accepting that past bpb numbers no longer compare:\n"
+              f"     python trains/fetch_data.py {budget_arg} --val-shard {n_train + 1}", file=sys.stderr)
         return 1
 
     data_dir = ds.DATA_DIR
