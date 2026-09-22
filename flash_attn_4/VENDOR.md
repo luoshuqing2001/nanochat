@@ -224,6 +224,36 @@ and 3.875e-03 against the float32 reference either way. One `log2` becomes five 
 
 `FA4_SOFTPLUS_EXACT=1` restores the `log2` form for a reference run.
 
+### The backward's score map is already within 2-4% of its floor
+
+Worth checking whether the same trick is owed to the backward, which is four fifths of
+attention fwd+bwd. It is not. Replacing the backward's score map with arithmetic that
+has *no* transcendental at all -- wrong results, timing only -- bounds everything any
+amount of score-map work could ever buy there (B8 T2048 H12):
+
+| | current | zero-transcendental probe | headroom |
+|---|---|---|---|
+| window 512 | 4.321 ms | 4.234 ms | 2.0% |
+| full causal | 6.784 ms | 6.496 ms | 4.2% |
+
+4.2% of a backward that is 67% of an attention that is 9.8% of the step is **0.3% of
+the step**, as an upper bound, for a perfect result. The backward's inner loop is bound
+by its two GEMMs and its memory traffic, not by the score map -- which is also why
+softplus's backward only beats softmax's by 1.03x (full causal) and 1.08x (windowed)
+despite skipping the entire `flash_bwd_preprocess` pass.
+
+Taken together with the scheduling result above, there is no meaningful headroom left
+in this kernel for *training*. Attention is 9.8% of a d12/bs32 step; the score map is
+within a few percent of its floor in both directions; the causal imbalance is absorbed
+by 64 waves of hardware scheduling and costs more to fix than it saves. The one gap
+left is that the Triton backward still beats this one on windowed layers (3.923 vs
+4.280 ms) -- and it beats FA4's *softmax* backward too, so it is FA4 accumulating dQ
+atomically into fp32 and converting it in a second pass, not anything about softplus.
+Closing it means rewriting upstream's dQ path for about 0.4% of a step.
+
+Training headroom is elsewhere: GEMM is 44.5% of the step, elementwise 33.5% (of which
+the MLP's `relu(x).square()` alone is 7.8%), the optimizer 6.9%. See `trains/RUNBOOK.md`.
+
 ### Does softplus actually make training faster? Barely.
 
 Forward alone is the flattering half. With the backward included (softplus's is still
