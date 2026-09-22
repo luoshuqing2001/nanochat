@@ -225,6 +225,23 @@ LR above 0.01. No quality claim is made either way: the short runs used for cali
 are all inside the LR warmup and say nothing about final loss. That comparison is the
 experiment to run.
 
+### Where the time goes
+
+```bash
+python trains/profile_step.py --depth 20 --device-batch-size 64 --fp8
+```
+
+Runs the same construction path as base_train (meta build, optional FP8 conversion,
+torch.compile, MuonAdamW) on synthetic tokens, so the dataloader is excluded, and
+reports step time, achieved TFLOPS, MFU, peak memory, a CUDA-time breakdown by kernel
+category, and the top kernels. `--no-compile` isolates what inductor is buying.
+
+Needs an idle GPU. Dataloader starvation does not show up here by construction --
+watch `nvidia-smi` utilization during a real run for that.
+
+MFU is only meaningful if the GPU is in `get_peak_flops()` (`nanochat/common.py`):
+b200 is, b300 and GB10 are not.
+
 ### Model internals
 
 base_train.py logs loss and throughput only. `nanochat/diagnostics.py` adds the
