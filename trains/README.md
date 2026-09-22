@@ -225,6 +225,34 @@ LR above 0.01. No quality claim is made either way: the short runs used for cali
 are all inside the LR warmup and say nothing about final loss. That comparison is the
 experiment to run.
 
+### The experiment series
+
+One file per point in the series, each pinning the knobs so the arms cannot drift:
+
+```bash
+bash trains/exp_d12_ctrl.sh      # control
+bash trains/exp_d16_ctrl.sh      # control
+bash trains/exp_d20_60b.sh       # the headline run
+MUON_VARIANT=nanochat bash trains/exp_d20_60b.sh   # its baseline arm
+RESUME=<run_id> bash trains/exp_d20_60b.sh         # after a container restart
+```
+
+All of them use the same `TARGET_PARAM_DATA_RATIO=138`, i.e. the same tokens per
+scaling parameter. That is deliberate: a control trained to a different length than
+the run it controls for confounds size with training duration, and no statement
+about how an effect moves with scale survives that. Matching it is also cheap --
+on one B200 at the 937 TFLOPS measured there:
+
+| | params | tokens | steps | wall clock |
+|---|---|---|---|---|
+| d12 | 286M | 15.2B | 28,980 | ~3.4 h |
+| d16 | 537M | 32.4B | 61,824 | ~15.2 h |
+| d20 | 897M | 60.1B | 57,270 | ~51 h |
+
+Cheaper points exist for screening, where no cross-size claim is made:
+`TARGET_PARAM_DATA_RATIO=12` is compute-optimal (d12: 1.3B tokens, 0.3 h; d16: 2.8B,
+1.3 h), and 52 / 46 give Chinchilla's 20 tokens per total parameter.
+
 ### Chunked loss head
 
 `LOSS_CHUNK_TOKENS=N` splits the lm_head + logit-softcap + cross-entropy over N tokens
