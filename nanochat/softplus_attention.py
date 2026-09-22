@@ -234,6 +234,97 @@ def _bwd_q_kernel(
              dq.to(DQ.dtype.element_ty), mask=offs_m[:, None] < T)
 
 
+@triton.jit
+def _fwd_splitk_kernel(
+    Q, K, V, O32,
+    sqb, sqt, sqh, skb, skt, skh, svb, svt, svh, sob, sot, soh,
+    T, scale, H: tl.constexpr, WINDOW: tl.constexpr, SPLITS: tl.constexpr,
+    HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """Forward with the key range split across SPLITS programs per query tile, each
+    accumulating its partial output with atomic_add into an fp32 buffer.
+
+    Causal masking makes work per query tile grow with its index -- tile 0 reads one key
+    tile, tile 31 reads 32 -- so one program per query tile is badly balanced. Splitting
+    the key range evens that out, and softplus is what allows it: the output is a plain
+    sum, so partial results can be added into a shared buffer. Softmax cannot, since each
+    tile's contribution depends on the row's global max and sum, which is why
+    FlashAttention writes per-split (O, m, l) and runs a combine pass.
+
+    Whether it pays is a race between balance, which is bounded, and atomic traffic,
+    which is SPLITS times the output volume. Measured on a GB10 (48 SMs), full context,
+    forward only, against one program per query tile:
+
+        B8  T2048  H10   2560 programs   1.82 ms   ->  4.49 (x2)  7.44 (x16)
+        B1  T8192  H4     512 programs   1.51 ms   ->  1.87 (x2)  2.70 (x16)
+        B1  T8192  H1     128 programs   0.57 ms   ->  0.49 (x2)  0.65 (x16)
+        B1 T16384  H1     256 programs   1.69 ms   ->  1.66 (x2)  1.99 (x16)
+
+    So it wins only when query-tile programs are within roughly 3x the SM count, and only
+    at 2 to 4 splits: long-context decoding or a batch of one, not pretraining. Hence
+    splits=1 by default.
+    """
+    pid_m = tl.program_id(0)
+    sid = tl.program_id(1)
+    bh = tl.program_id(2)
+    off_b = bh // H
+    off_h = bh % H
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+    diag = pid_m * BLOCK_M
+    hi_all = tl.minimum(diag + BLOCK_M, T)
+    lo_all = 0
+    if WINDOW >= 0:
+        lo_all = tl.maximum(0, diag - WINDOW)
+        lo_all = (lo_all // BLOCK_N) * BLOCK_N
+
+    ntiles = (hi_all - lo_all + BLOCK_N - 1) // BLOCK_N
+    per = (ntiles + SPLITS - 1) // SPLITS
+    lo = lo_all + sid * per * BLOCK_N
+    hi = tl.minimum(lo + per * BLOCK_N, hi_all)
+    if lo >= hi:
+        return
+
+    q = tl.load(Q + off_b * sqb + off_h * sqh + offs_m[:, None] * sqt + offs_d[None, :],
+                mask=offs_m[:, None] < T, other=0.0)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    for start_n in range(lo, hi, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        km = offs_n[:, None] < T
+        k = tl.load(K + off_b * skb + off_h * skh + offs_n[:, None] * skt + offs_d[None, :],
+                    mask=km, other=0.0)
+        v = tl.load(V + off_b * svb + off_h * svh + offs_n[:, None] * svt + offs_d[None, :],
+                    mask=km, other=0.0)
+        s = tl.dot(q, tl.trans(k)) * scale
+        keep = (offs_n[None, :] <= offs_m[:, None]) & (offs_n[None, :] < T)
+        if WINDOW >= 0:
+            keep = keep & ((offs_m[:, None] - offs_n[None, :]) <= WINDOW)
+        acc += tl.dot(tl.where(keep, _softplus(s), 0.0).to(v.dtype), v)
+
+    tl.atomic_add(O32 + off_b * sob + off_h * soh + offs_m[:, None] * sot + offs_d[None, :],
+                  acc, mask=offs_m[:, None] < T)
+
+
+def _fwd_splitk(q, k, v, window, alpha, scale, splits):
+    """Split-K forward. The n^-alpha scaling has to wait until every split has landed,
+    so it happens here rather than in the kernel."""
+    B, T, H, D = q.shape
+    cfg = _fwd_config(window)
+    o32 = torch.zeros(B, T, H, D, device=q.device, dtype=torch.float32)
+    _fwd_splitk_kernel[(triton.cdiv(T, cfg["BLOCK_M"]), splits, B * H)](
+        q, k, v, o32,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        o32.stride(0), o32.stride(1), o32.stride(2),
+        T, scale, H=H, WINDOW=window, SPLITS=splits, HEAD_DIM=D, **cfg,
+    )
+    i = torch.arange(T, device=q.device, dtype=torch.float32)
+    n = i + 1 if window < 0 else torch.clamp(i + 1, max=window + 1)
+    return (o32 * n.pow(-alpha)[None, :, None, None]).to(q.dtype)
+
+
 def _fwd_config(window):
     """Launch configuration, swept on a GB10 at B8 T2048 H10 D128 bf16.
 

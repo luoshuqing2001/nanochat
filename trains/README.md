@@ -324,16 +324,28 @@ Three things got it there from 1.22 / 2.30 ms forward:
 What remains is structural: softplus costs two transcendentals per score (exp and log)
 where softmax costs one exp, and FA4's full-context kernel is simply better engineered.
 
-**On atomics.** Because the output is an unnormalised sum, key tiles *can* be accumulated
-with `atomic_add` -- with softmax they cannot, since each tile's contribution depends on
-the row's global max and sum, which is why FlashAttention needs a separate combine pass
-(`flash_attn_4/flash_fwd_combine.py`). `_bwd_fused_kernel` does exactly that: one pass
-computing `Q K^T` once and atomically accumulating dK/dV. It is correct and slower --
-0.90 ms for the two-kernel backward against 1.32 ms fused at B4 T1024 H8 D128 window 255
--- because under causal masking every later query tile contends for the same dK/dV tile.
-The shipped backward therefore uses no atomics at all.
-It is kept for the regime where it wins: a forward split over keys when there are too few
-query tiles to fill the GPU, which is decoding.
+**On atomics and load balance.** Causal masking makes work per query tile grow with its
+index -- tile 0 reads one key tile, tile 31 reads 32 -- so one program per query tile is
+unbalanced by construction. Because the output here is an unnormalised sum, the key range
+*can* be split across programs that each `atomic_add` their partial output, which softmax
+cannot do: its tile contributions depend on the row's global max and sum, hence
+FlashAttention's per-split `(O, m, l)` and its combine pass (`flash_fwd_combine.py`).
+
+`_fwd_splitk_kernel` does this, and measurement decides when it is worth it. Balance is a
+bounded gain; atomic traffic is `splits` times the output volume, a linear cost. On a
+GB10 (48 SMs), full context, forward only:
+
+| shape | query-tile programs | 1 program/tile | x2 | x4 | x16 |
+|---|---|---|---|---|---|
+| B8 T2048 H10 | 2560 | **1.82 ms** | 4.49 | 5.29 | 7.44 |
+| B1 T8192 H4 | 512 | **1.51 ms** | 1.87 | 2.00 | 2.70 |
+| B1 T8192 H1 | 128 | 0.57 ms | **0.49** | **0.49** | 0.65 |
+| B1 T16384 H1 | 256 | 1.69 ms | **1.66** | **1.66** | 1.99 |
+
+It wins only when query-tile programs are within roughly 3x the SM count, and only at 2
+to 4 splits -- long-context decoding, or a batch of one. At training shapes the scheduler
+already hides the imbalance across 2560 programs while the atomic traffic is real, so
+`splits=1` is the default and the shipped forward and backward use no atomics at all.
 
 ### Chunked loss head
 
