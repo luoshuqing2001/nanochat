@@ -38,13 +38,27 @@ import triton.language as tl
 
 @triton.jit
 def _softplus(x):
-    """softplus(s) = max(s, 0) + log(1 + exp(-|s|)).
+    """softplus(s) = max(s, 0) + log(1 + exp(-|s|)), evaluated in base 2.
 
-    Algebraically identical to log(1 + exp(s)), but the exponent is never positive, so
-    the exponential cannot overflow for any input and no branch or clamp on magnitude is
-    needed. The branchy form this replaced (return s above a threshold) also dropped the
-    log term there, which this keeps."""
-    return tl.maximum(x, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(x)))
+    The max/|s| form keeps the exponent non-positive, so the exponential cannot overflow
+    for any input, with no branch or clamp on magnitude. Writing it with exp2/log2 maps
+    onto the hardware's ex2/lg2 instructions directly; exp/log lower to the same
+    instructions plus a multiply each.
+
+    Note softplus costs two transcendentals per score against softmax's one exp, which is
+    a structural cost of the score map, not of this implementation."""
+    # constants inlined: a @triton.jit body cannot capture module-level floats
+    return tl.maximum(x, 0.0) + tl.log2(1.0 + tl.exp2(-tl.abs(x) * 1.4426950408889634)) * 0.6931471805599453
+
+
+@triton.jit
+def _row_scale(offs_m, alpha, WINDOW: tl.constexpr):
+    """c_i = n_i^-alpha with n_i = min(i+1, WINDOW+1). Index arithmetic, no reduction --
+    this is what replaces softmax's row sum, and why no tile ever needs the others."""
+    n = offs_m + 1
+    if WINDOW >= 0:
+        n = tl.minimum(n, WINDOW + 1)
+    return tl.exp(-alpha * tl.log(n.to(tl.float32)))[:, None]
 
 
 @triton.jit
@@ -56,55 +70,188 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
-    bh = tl.program_id(1)
-    b = bh // tl.num_programs(2) if False else bh  # bh packs (batch, head), see grid
     off_b = tl.program_id(1)
     off_h = tl.program_id(2)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_DIM)
-
-    q_ptrs = Q + off_b * sqb + off_h * sqh + offs_m[:, None] * sqt + offs_d[None, :]
-    q = tl.load(q_ptrs, mask=offs_m[:, None] < T, other=0.0)
-
+    q = tl.load(Q + off_b * sqb + off_h * sqh + offs_m[:, None] * sqt + offs_d[None, :],
+                mask=offs_m[:, None] < T, other=0.0)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
-    # causal: keys up to the last query in this tile. window: not before i - WINDOW.
-    hi = tl.minimum((pid_m + 1) * BLOCK_M, T)
+    diag = pid_m * BLOCK_M                      # first key index on the diagonal tile
+    hi = tl.minimum(diag + BLOCK_M, T)
     lo = 0
     if WINDOW >= 0:
-        lo = tl.maximum(0, pid_m * BLOCK_M - WINDOW)
+        lo = tl.maximum(0, diag - WINDOW)
         lo = (lo // BLOCK_N) * BLOCK_N
 
-    for start_n in range(lo, hi, BLOCK_N):
+    # Bulk: every key in these tiles is strictly before every query in this tile, so the
+    # causal comparison is known true and only the window edge can bite. Splitting it out
+    # keeps the compare-and-select off the tiles that do not need it -- at T=2048 with
+    # 64-wide tiles a mid-sequence query tile has ~16 key tiles and only one is diagonal.
+    for start_n in range(lo, diag, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
-        k_ptrs = K + off_b * skb + off_h * skh + offs_n[:, None] * skt + offs_d[None, :]
-        v_ptrs = V + off_b * svb + off_h * svh + offs_n[:, None] * svt + offs_d[None, :]
-        k = tl.load(k_ptrs, mask=offs_n[:, None] < T, other=0.0)
-        v = tl.load(v_ptrs, mask=offs_n[:, None] < T, other=0.0)
+        k = tl.load(K + off_b * skb + off_h * skh + offs_n[:, None] * skt + offs_d[None, :])
+        v = tl.load(V + off_b * svb + off_h * svh + offs_n[:, None] * svt + offs_d[None, :])
+        p = _softplus(tl.dot(q, tl.trans(k)) * scale)
+        if WINDOW >= 0:
+            p = tl.where((offs_m[:, None] - offs_n[None, :]) <= WINDOW, p, 0.0)
+        acc += tl.dot(p.to(v.dtype), v)
 
+    # Diagonal tile: the only one that needs the causal mask.
+    for start_n in range(diag, hi, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        kmask = offs_n[:, None] < T
+        k = tl.load(K + off_b * skb + off_h * skh + offs_n[:, None] * skt + offs_d[None, :],
+                    mask=kmask, other=0.0)
+        v = tl.load(V + off_b * svb + off_h * svh + offs_n[:, None] * svt + offs_d[None, :],
+                    mask=kmask, other=0.0)
         s = tl.dot(q, tl.trans(k)) * scale
         keep = (offs_n[None, :] <= offs_m[:, None]) & (offs_n[None, :] < T)
         if WINDOW >= 0:
             keep = keep & ((offs_m[:, None] - offs_n[None, :]) <= WINDOW)
-        p = tl.where(keep, _softplus(s), 0.0)
-        acc += tl.dot(p.to(v.dtype), v)
+        acc += tl.dot(tl.where(keep, _softplus(s), 0.0).to(v.dtype), v)
 
-    # n_i: how many keys this query saw. Index arithmetic, no reduction.
-    n = offs_m + 1
+    acc = acc * _row_scale(offs_m, alpha, WINDOW)
+    tl.store(O + off_b * sob + off_h * soh + offs_m[:, None] * sot + offs_d[None, :],
+             acc.to(O.dtype.element_ty), mask=offs_m[:, None] < T)
+
+
+@triton.jit
+def _bwd_kv_kernel(
+    Q, K, V, DO, DK, DV,
+    sqb, sqt, sqh, skb, skt, skh, svb, svt, svh, sdob, sdot, sdoh,
+    T, scale, alpha,
+    WINDOW: tl.constexpr, HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """One program per key tile: dK_j = scale * sum_i dS_ij q_i, dV_j = sum_i c_i P_ij dO_i."""
+    pid_n = tl.program_id(0)
+    off_b = tl.program_id(1)
+    off_h = tl.program_id(2)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+    kmask = offs_n[:, None] < T
+    k = tl.load(K + off_b * skb + off_h * skh + offs_n[:, None] * skt + offs_d[None, :],
+                mask=kmask, other=0.0)
+    v = tl.load(V + off_b * svb + off_h * svh + offs_n[:, None] * svt + offs_d[None, :],
+                mask=kmask, other=0.0)
+    dk = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+    dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+
+    diag = (pid_n * BLOCK_N // BLOCK_M) * BLOCK_M
+    hi = T
     if WINDOW >= 0:
-        n = tl.minimum(n, WINDOW + 1)
-    acc = acc * tl.exp(-alpha * tl.log(n.to(tl.float32)))[:, None]
+        hi = tl.minimum(T, (pid_n + 1) * BLOCK_N + WINDOW)
 
-    o_ptrs = O + off_b * sob + off_h * soh + offs_m[:, None] * sot + offs_d[None, :]
-    tl.store(o_ptrs, acc.to(O.dtype.element_ty), mask=offs_m[:, None] < T)
+    for start_m in range(diag, hi, BLOCK_M):
+        offs_m = start_m + tl.arange(0, BLOCK_M)
+        mmask = offs_m[:, None] < T
+        q = tl.load(Q + off_b * sqb + off_h * sqh + offs_m[:, None] * sqt + offs_d[None, :],
+                    mask=mmask, other=0.0)
+        do = tl.load(DO + off_b * sdob + off_h * sdoh + offs_m[:, None] * sdot + offs_d[None, :],
+                     mask=mmask, other=0.0)
+
+        s = tl.dot(q, tl.trans(k)) * scale
+        keep = (offs_n[None, :] <= offs_m[:, None]) & (offs_n[None, :] < T) & mmask
+        if WINDOW >= 0:
+            keep = keep & ((offs_m[:, None] - offs_n[None, :]) <= WINDOW)
+        c = _row_scale(offs_m, alpha, WINDOW)
+
+        sp = _softplus(s)
+        # sigmoid(s) = 1 - exp(-softplus(s)): reuses the softplus already computed instead
+        # of a second transcendental pair. Exact, and sp >= 0 keeps the exponent negative.
+        sig = 1.0 - tl.exp(-sp)
+
+        p = tl.where(keep, sp, 0.0) * c
+        dv += tl.dot(tl.trans(p).to(do.dtype), do)
+        dp = tl.dot(do, tl.trans(v)) * c
+        ds = tl.where(keep, dp * sig, 0.0)
+        dk += tl.dot(tl.trans(ds).to(q.dtype), q) * scale
+
+    tl.store(DK + off_b * skb + off_h * skh + offs_n[:, None] * skt + offs_d[None, :],
+             dk.to(DK.dtype.element_ty), mask=kmask)
+    tl.store(DV + off_b * svb + off_h * svh + offs_n[:, None] * svt + offs_d[None, :],
+             dv.to(DV.dtype.element_ty), mask=kmask)
+
+
+@triton.jit
+def _bwd_q_kernel(
+    Q, K, V, DO, DQ,
+    sqb, sqt, sqh, skb, skt, skh, svb, svt, svh, sdob, sdot, sdoh,
+    T, scale, alpha,
+    WINDOW: tl.constexpr, HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """One program per query tile: dQ_i = scale * sum_j dS_ij k_j."""
+    pid_m = tl.program_id(0)
+    off_b = tl.program_id(1)
+    off_h = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+    q = tl.load(Q + off_b * sqb + off_h * sqh + offs_m[:, None] * sqt + offs_d[None, :],
+                mask=offs_m[:, None] < T, other=0.0)
+    do = tl.load(DO + off_b * sdob + off_h * sdoh + offs_m[:, None] * sdot + offs_d[None, :],
+                 mask=offs_m[:, None] < T, other=0.0)
+    dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    c = _row_scale(offs_m, alpha, WINDOW)
+
+    diag = pid_m * BLOCK_M
+    hi = tl.minimum(diag + BLOCK_M, T)
+    lo = 0
+    if WINDOW >= 0:
+        lo = tl.maximum(0, diag - WINDOW)
+        lo = (lo // BLOCK_N) * BLOCK_N
+
+    for start_n in range(lo, diag, BLOCK_N):          # bulk, causal known true
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        k = tl.load(K + off_b * skb + off_h * skh + offs_n[:, None] * skt + offs_d[None, :])
+        v = tl.load(V + off_b * svb + off_h * svh + offs_n[:, None] * svt + offs_d[None, :])
+        s = tl.dot(q, tl.trans(k)) * scale
+        ds = tl.dot(do, tl.trans(v)) * c * tl.sigmoid(s)
+        if WINDOW >= 0:
+            ds = tl.where((offs_m[:, None] - offs_n[None, :]) <= WINDOW, ds, 0.0)
+        dq += tl.dot(ds.to(k.dtype), k) * scale
+
+    for start_n in range(diag, hi, BLOCK_N):          # diagonal tile
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        kmask = offs_n[:, None] < T
+        k = tl.load(K + off_b * skb + off_h * skh + offs_n[:, None] * skt + offs_d[None, :],
+                    mask=kmask, other=0.0)
+        v = tl.load(V + off_b * svb + off_h * svh + offs_n[:, None] * svt + offs_d[None, :],
+                    mask=kmask, other=0.0)
+        s = tl.dot(q, tl.trans(k)) * scale
+        keep = (offs_n[None, :] <= offs_m[:, None]) & (offs_n[None, :] < T)
+        if WINDOW >= 0:
+            keep = keep & ((offs_m[:, None] - offs_n[None, :]) <= WINDOW)
+        ds = tl.where(keep, tl.dot(do, tl.trans(v)) * c * tl.sigmoid(s), 0.0)
+        dq += tl.dot(ds.to(k.dtype), k) * scale
+
+    tl.store(DQ + off_b * sqb + off_h * sqh + offs_m[:, None] * sqt + offs_d[None, :],
+             dq.to(DQ.dtype.element_ty), mask=offs_m[:, None] < T)
+
+
+def _fwd_config(window):
+    """Launch configuration, swept on a GB10 at B8 T2048 H10 D128 bf16.
+
+    The optimum moves with the window: a full-context tile spends most of its time in the
+    bulk loop and wants the larger query tile, while a 512-wide window has only a handful
+    of key tiles per query tile and does better with fewer warps. Measured forward times:
+    full context 2.22 ms at 64x64/w8/s2 against 1.84 ms here; window 512 1.22 ms against
+    1.08 ms. Deeper pipelining (3 stages) helps both."""
+    if 0 <= window <= 1024:
+        return dict(BLOCK_M=64, BLOCK_N=64, num_warps=4, num_stages=3)
+    return dict(BLOCK_M=128, BLOCK_N=64, num_warps=8, num_stages=3)
 
 
 def _fwd(q, k, v, window, alpha, scale):
     B, T, H, D = q.shape
     o = torch.empty_like(q)
-    BLOCK_M = BLOCK_N = 64
-    grid = (triton.cdiv(T, BLOCK_M), B, H)
+    cfg = _fwd_config(window)
+    grid = (triton.cdiv(T, cfg["BLOCK_M"]), B, H)
     _fwd_kernel[grid](
         q, k, v, o,
         q.stride(0), q.stride(1), q.stride(2),
@@ -112,8 +259,7 @@ def _fwd(q, k, v, window, alpha, scale):
         v.stride(0), v.stride(1), v.stride(2),
         o.stride(0), o.stride(1), o.stride(2),
         T, scale, alpha,
-        WINDOW=window, HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        num_warps=8, num_stages=2,
+        WINDOW=window, HEAD_DIM=D, **cfg,
     )
     return o
 
@@ -241,6 +387,9 @@ def _bwd(q, k, v, do, window, alpha, scale, BLOCK_M=64, BLOCK_N=64):
             v.stride(0), v.stride(1), v.stride(2),
             do.stride(0), do.stride(1), do.stride(2),
             T, scale, alpha)
+    # 64x64 with 8 warps measured best for both window regimes; the larger query tiles
+    # that help the forward do not compile here (shared memory holds q, k, v, do and two
+    # accumulators at once).
     kw = dict(WINDOW=window, HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
               num_warps=8, num_stages=2)
     _bwd_kv_kernel[(triton.cdiv(T, BLOCK_N), B, H)](q, k, v, do, dk, dv, *args, **kw)

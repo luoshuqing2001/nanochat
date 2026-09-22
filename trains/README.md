@@ -302,10 +302,27 @@ is not at its best):
 
 | layer | softplus fwd | FA4 fwd | softplus fwd+bwd | FA4 fwd+bwd |
 |---|---|---|---|---|
-| sliding window 512 | 1.24 ms | 1.39 ms | 6.62 ms | 7.23 ms |
-| full context | 2.57 ms | 1.37 ms | 10.49 ms | 9.50 ms |
+| sliding window 512 | **1.08 ms** | 1.38 ms | **5.97 ms** | 6.86 ms |
+| full context | 1.81 ms | **1.38 ms** | 9.68 ms | **8.80 ms** |
 
-End to end at d12 the two are level: 45,179 vs 44,982 tok/s.
+Over a d20's SSSL layout (18 windowed layers, 6 full) that is 166 ms of attention per
+micro-batch against FA4's 176 ms. End to end at d12 the two are level: 45,179 vs 44,982
+tok/s.
+
+Three things got it there from 1.22 / 2.30 ms forward:
+
+- **Launch configuration per window.** Nothing was tuned at first. A full-context tile
+  spends its time in the bulk loop and wants a 128-row query tile with 8 warps; a
+  512-wide window has few key tiles per query tile and prefers 64 rows with 4 warps.
+  Three pipeline stages help both. Worth 21% of the full-context forward.
+- **Masking split out of the bulk loop.** Only the diagonal tile needs the causal
+  comparison; at T=2048 with 64-wide tiles a mid-sequence query tile has ~16 key tiles
+  and 15 of them were paying for a compare-and-select that is known true.
+- **Base-2 transcendentals.** `exp2`/`log2` are the hardware instructions; `exp`/`log`
+  lower to those plus a multiply.
+
+What remains is structural: softplus costs two transcendentals per score (exp and log)
+where softmax costs one exp, and FA4's full-context kernel is simply better engineered.
 
 **On atomics.** Because the output is an unnormalised sum, key tiles *can* be accumulated
 with `atomic_add` -- with softmax they cannot, since each tile's contribution depends on
@@ -314,6 +331,7 @@ the row's global max and sum, which is why FlashAttention needs a separate combi
 computing `Q K^T` once and atomically accumulating dK/dV. It is correct and slower --
 0.90 ms for the two-kernel backward against 1.32 ms fused at B4 T1024 H8 D128 window 255
 -- because under causal masking every later query tile contends for the same dK/dV tile.
+The shipped backward therefore uses no atomics at all.
 It is kept for the regime where it wins: a forward split over keys when there are too few
 query tiles to fill the GPU, which is decoding.
 
