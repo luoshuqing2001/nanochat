@@ -271,7 +271,7 @@ write_run_header() {
     NUM_ITERATIONS="$NUM_ITERATIONS" TARGET_PARAM_DATA_RATIO="$TARGET_PARAM_DATA_RATIO" \
     NPROC_PER_NODE="$NPROC_PER_NODE" NUM_SHARDS="$NUM_SHARDS" \
     DIAGNOSTICS_EVERY="$DIAGNOSTICS_EVERY" MUON_VARIANT="$MUON_VARIANT" \
-    FP8="$FP8" FP8_RECIPE="$FP8_RECIPE" \
+    FP8="$FP8" FP8_RECIPE="$FP8_RECIPE" ATTN_KIND="$ATTN_KIND" \
     GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
     GIT_DIRTY="$(git status --porcelain 2>/dev/null | wc -l)" \
     "$PYTHON_BIN" - <<'RUN_HEADER_PY'
@@ -452,6 +452,10 @@ TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:-524288}"   # tokens per optimizer step (-1
 # one extra lm_head matmul, a few percent of model FLOPs. 0 disables.
 LOSS_CHUNK_TOKENS="${LOSS_CHUNK_TOKENS:-0}"
 
+# Attention score map: softmax (FA3/FA4/SDPA) or softplus (elementwise, unnormalised).
+ATTN_KIND="${ATTN_KIND:-softmax}"
+SOFTPLUS_ALPHA="${SOFTPLUS_ALPHA:-1.0}"
+
 FP8="${FP8:-0}"
 FP8_RECIPE="${FP8_RECIPE:-tensorwise}"   # tensorwise (faster) | rowwise (more accurate)
 
@@ -581,6 +585,8 @@ cat > "$RUN_DIR/config.json" <<JSON
   "optimizer": "MuonAdamW (Muon on matrices, AdamW on embeddings/scalars)",
   "muon_variant": "$MUON_VARIANT",
   "loss_chunk_tokens": $LOSS_CHUNK_TOKENS,
+  "attn_kind": "$ATTN_KIND",
+  "softplus_alpha": $SOFTPLUS_ALPHA,
   "fp8": $([ "$FP8" = "1" ] && echo true || echo false),
   "fp8_recipe": "$FP8_RECIPE",
   "device_batch_size": $DEVICE_BATCH_SIZE,
@@ -620,6 +626,8 @@ TRAIN_ARGS=(
     --max-seq-len="$MAX_SEQ_LEN"
     --window-pattern="$WINDOW_PATTERN"
     --loss-chunk-tokens="$LOSS_CHUNK_TOKENS"
+    --attn-kind="$ATTN_KIND"
+    --softplus-alpha="$SOFTPLUS_ALPHA"
     --device-batch-size="$DEVICE_BATCH_SIZE"
     --total-batch-size="$TOTAL_BATCH_SIZE"
     --matrix-lr="$MATRIX_LR"

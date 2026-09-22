@@ -276,6 +276,47 @@ Override for a different budget, e.g. compute-optimal screening:
 TARGET_PARAM_DATA_RATIO=12 bash trains/exp_d12_ctrl.sh    # 1.3B tokens, 0.3 h
 ```
 
+### Softplus attention
+
+`ATTN_KIND=softplus` replaces the softmax with an elementwise softplus and no row
+normalisation: `O_i = n_i^-alpha * sum_j softplus(q_i . k_j * scale) v_j`, following the
+scaled point-wise family `n^-alpha h(S)` of
+[Replacing softmax with ReLU in ViT](https://arxiv.org/html/2309.08586) with h = softplus
+as in [Softplus Attention with Re-weighting](https://www.arxiv.org/pdf/2501.13428).
+`SOFTPLUS_ALPHA` defaults to 1, which reproduces softmax's scale behaviour; 0.5 makes the
+output scale position-independent.
+
+The kernel is Triton, in `nanochat/softplus_attention.py`, wrapped in torch.library
+custom ops so a compiled model keeps one graph (0 graph breaks, same lesson as FA4).
+
+Dropping the normalisation makes the kernel structurally simpler than FlashAttention,
+not just different. Softmax's row sum is data dependent, so a tiled kernel carries a
+running max and sum and rescales the accumulator -- the online-softmax algorithm. Here
+the only row quantity is `n_i = min(i+1, window+1)`, pure index arithmetic, so the loop
+is `acc += softplus(Q Kj^T) @ Vj` with no reductions, no rescaling and no LSE. The
+backward also loses softmax's `sum(dO * O)` correction, since `d softplus = sigmoid` is
+elementwise.
+
+Measured on one GB10, B8 T2048 H10 D128 bf16, against FA4 (SM120 kernels there, so FA4
+is not at its best):
+
+| layer | softplus fwd | FA4 fwd | softplus fwd+bwd | FA4 fwd+bwd |
+|---|---|---|---|---|
+| sliding window 512 | 1.24 ms | 1.39 ms | 6.62 ms | 7.23 ms |
+| full context | 2.57 ms | 1.37 ms | 10.49 ms | 9.50 ms |
+
+End to end at d12 the two are level: 45,179 vs 44,982 tok/s.
+
+**On atomics.** Because the output is an unnormalised sum, key tiles *can* be accumulated
+with `atomic_add` -- with softmax they cannot, since each tile's contribution depends on
+the row's global max and sum, which is why FlashAttention needs a separate combine pass
+(`flash_attn_4/flash_fwd_combine.py`). `_bwd_fused_kernel` does exactly that: one pass
+computing `Q K^T` once and atomically accumulating dK/dV. It is correct and slower --
+0.90 ms for the two-kernel backward against 1.32 ms fused at B4 T1024 H8 D128 window 255
+-- because under causal masking every later query tile contends for the same dK/dV tile.
+It is kept for the regime where it wins: a forward split over keys when there are too few
+query tiles to fill the GPU, which is decoding.
+
 ### Chunked loss head
 
 `LOSS_CHUNK_TOKENS=N` splits the lm_head + logit-softcap + cross-entropy over N tokens

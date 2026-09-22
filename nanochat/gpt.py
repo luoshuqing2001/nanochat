@@ -37,6 +37,10 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Attention score map: "softmax" (normalised, FA3/FA4/SDPA) or "softplus"
+    # (elementwise, unnormalised, scaled by n^-softplus_alpha; see softplus_attention.py)
+    attn_kind: str = "softmax"
+    softplus_alpha: float = 1.0
 
 
 def norm(x):
@@ -78,6 +82,8 @@ class CausalSelfAttention(nn.Module):
         self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+        self.attn_kind = config.attn_kind
+        self.softplus_alpha = config.softplus_alpha
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
@@ -105,7 +111,19 @@ class CausalSelfAttention(nn.Module):
 
         # Flash Attention (FA3 or SDPA fallback)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if kv_cache is None:
+        if self.attn_kind == "softplus":
+            from nanochat.softplus_attention import softplus_attn_func, softplus_attn_with_kvcache
+            if kv_cache is None:
+                y = softplus_attn_func(q, k, v, causal=True, window_size=window_size,
+                                       alpha=self.softplus_alpha)
+            else:
+                k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+                y = softplus_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v,
+                                               cache_seqlens=kv_cache.cache_seqlens,
+                                               window_size=window_size, alpha=self.softplus_alpha)
+                if self.layer_idx == kv_cache.n_layers - 1:
+                    kv_cache.advance(T)
+        elif kv_cache is None:
             # Training: causal attention with optional sliding window
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
