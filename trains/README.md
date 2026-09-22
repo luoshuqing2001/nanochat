@@ -139,10 +139,19 @@ architectures. What the literature does at this scale:
   budgets**: scaling curves cross, and an advantage visible at a small budget can
   vanish or reverse later. Compare only within a matched budget, and treat a cheap
   screening result as a hypothesis, not a finding.
-- Storage does not have to scale with the budget. [Muennighoff et al., "Scaling
-  Data-Constrained Language Models"](https://arxiv.org/abs/2305.16264) (NeurIPS 2023)
-  found up to ~4 epochs of repeated data costs almost nothing versus fresh tokens, so
-  `--epochs 4` cuts a 100B-token run down to 25B unique tokens on disk.
+- **Use single-epoch data for the headline comparison.** Those papers take 100B as a
+  *subset* of a much larger corpus (SlimPajama is 627B, FineWeb-Edu is trillions), so
+  their numbers are one pass over fresh tokens, and matching that is what makes your
+  numbers comparable to theirs.
+- [Muennighoff et al., "Scaling Data-Constrained Language Models"](https://arxiv.org/abs/2305.16264)
+  (NeurIPS 2023) found up to ~4 epochs costs almost nothing versus fresh tokens, and
+  `--epochs 4` does cut a 100B-token run to 25B unique tokens on disk. But that result
+  is about being *data*-constrained; here the constraint is disk, which is cheap next
+  to the GPU-days the run costs. More importantly, memorization under repetition
+  depends on capacity, depth and width, so repeating data adds an
+  architecture-dependent term to exactly the quantity an architecture ablation is
+  trying to measure. Keep `--epochs > 1` for screening runs and for comparisons where
+  both arms have identical capacity (e.g. optimizer variants).
 
 A workable ladder: screen variants at d12 (1.3B tokens, 7.3 h on GB10), promote
 survivors to d16, and run the claim at d24 with 26B tokens (Chinchilla) or 100B
