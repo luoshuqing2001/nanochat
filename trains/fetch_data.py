@@ -65,6 +65,42 @@ def scaling_params(depth, aspect_ratio=64, head_dim=128, seq_len=2048, vocab_siz
     return counts["transformer_matrices"] + counts["lm_head"], dim, counts["total"]
 
 
+def verify_yield(tokens, n_train, n_shards):
+    """Measure what the dataloader actually delivers, instead of trusting TOKENS_PER_SHARD.
+
+    The raw token count of a shard is not what training consumes: the BOS best-fit
+    packer crops documents to fill rows exactly and discards the remainder. Measured
+    here: 54.1M raw -> 44.9M delivered, i.e. 17% lost (the docstring in dataloader.py
+    says ~35%, which does not match this corpus at seq_len 2048).
+    """
+    import time
+    from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bos_bestfit as loader
+    from nanochat.tokenizer import get_tokenizer
+
+    print(f"\nverifying: consuming {n_shards} shards through the real dataloader (CPU, ~{25*n_shards}s)...")
+    B, T = 16, 2048
+    delivered, marks = 0, {}
+    for _x, _y, st in loader(get_tokenizer(), B, T, split="train", device="cpu"):
+        delivered += B * T
+        pq = st["pq_idx"]
+        marks.setdefault(pq, delivered)
+        if pq >= n_shards + 1:
+            break
+    # skip shard 0: the document buffer is still filling, which biases it
+    per_shard = (marks[n_shards + 1] - marks[1]) / n_shards
+    total = n_train * per_shard
+    print(f"  delivered: {per_shard/1e6:.1f}M tokens per shard "
+          f"(the estimate used for sizing was {TOKENS_PER_SHARD/1e6:.1f}M)")
+    print(f"  {n_train} train shards -> {total/1e9:.1f}B tokens for a {tokens/1e9:.0f}B budget"
+          f"  ({100*(total-tokens)/tokens:+.0f}%)")
+    if total < tokens:
+        print(f"  SHORT by {(tokens-total)/1e9:.1f}B: training would wrap around and repeat data. "
+              f"Re-run with a larger --margin.", file=sys.stderr)
+        return 1
+    print("  OK: enough for a single pass")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     g = ap.add_mutually_exclusive_group(required=True)
@@ -78,6 +114,10 @@ def main():
                     help="shard index reserved as the validation set; must stay the highest kept index (default 2499)")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--verify", action="store_true",
+                    help="after checking the plan, run the real dataloader over a few shards and report "
+                         "how many tokens it actually delivers per shard (~90 s, CPU only)")
+    ap.add_argument("--verify-shards", type=int, default=3, help="shards to consume when verifying (default 3)")
     ap.add_argument("--prune", action="store_true", help="also delete shards outside the keep set")
     ap.add_argument("--yes", action="store_true", help="actually delete when --prune is given")
     args = ap.parse_args()
@@ -162,6 +202,11 @@ def main():
         print(f"\n  to reclaim the surplus: python trains/fetch_data.py "
               + (f"--depth {args.depth}" if args.depth else f"--tokens {args.tokens:g}")
               + f" --val-shard {args.val_shard} --prune --yes")
+
+    if args.verify:
+        rc = verify_yield(tokens, n_train, args.verify_shards)
+        if args.dry_run:
+            return rc
 
     if args.dry_run:
         print("\n--dry-run: nothing downloaded, nothing deleted")
