@@ -135,7 +135,10 @@ def main():
     missing = sorted(keep - present)
     surplus = sorted(present - keep)
 
-    print(f"\ndata dir: {data_dir}")
+    print(f"\nsource:   {ds.BASE_URL}")
+    print(f"          shards 0..{ds.MAX_SHARD} exist upstream (~{(ds.MAX_SHARD + 1) * TOKENS_PER_SHARD / 1e9:.0f}B "
+          f"tokens with this tokenizer; the '400b' in the name counts them with another)")
+    print(f"data dir: {data_dir}")
     print(f"  present: {len(present)} shards ({len(present) * SHARD_MB / 1024:.0f} GB)")
     print(f"  need:    {len(keep)} shards (train 0..{n_train - 1}, val {args.val_shard})")
     print(f"  missing: {len(missing)} shards to download ({len(missing) * SHARD_MB / 1024:.0f} GB)")
