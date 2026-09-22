@@ -21,6 +21,7 @@ import math
 import cutlass
 import cutlass.cute as cute
 
+from flash_attn_4.balanced_scheduler import BalancedCausalScheduler
 from flash_attn_4.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn_4.flash_bwd_sm120 import FlashAttentionBackwardSm120
 from flash_attn_4.softplus import softplus_, LOG2_E
@@ -28,6 +29,17 @@ from flash_attn_4.softplus import softplus_, LOG2_E
 
 class SoftplusBackwardMixin:
     """Swaps the two score-map-dependent steps of FA4's backward for softplus ones."""
+
+    def __init__(self, *args, balanced_m_chunk=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Balanced scheduling, mirrored from the forward: a constant number of query
+        # tiles per CTA and as many CTAs per KV block as it needs. dK/dV then have to be
+        # aggregated with atomic_add, which turns on FA4's GQA accumulator path.
+        self.balanced_m_chunk = None if balanced_m_chunk is None else int(balanced_m_chunk)
+        if self.balanced_m_chunk is not None:
+            self.m_blocks_per_chunk = self.balanced_m_chunk
+            self.tile_scheduler_cls = BalancedCausalScheduler
+            self.dkv_atomic = True
 
     @cute.jit
     def bwd_recompute_p(

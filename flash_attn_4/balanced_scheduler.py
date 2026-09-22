@@ -135,3 +135,62 @@ class BalancedCausalScheduler:
 
     def advance_to_next_work(self, *, loc=None, ip=None) -> WorkTileInfo:
         return WorkTileInfo((Int32(0), Int32(0), Int32(0), Int32(0)), cutlass.Boolean(False))
+
+
+def causal_m_block_counts(seqlen_q, seqlen_k, tile_m, tile_n, causal, window_left,
+                          window_right=None):
+    """Query tiles each KV block is attended by -- the causal triangle, mirrored.
+
+    Mirrors BlockInfo.get_m_block_min_max, which is what the backward's own range
+    computation uses.
+    """
+    counts = []
+    num_n = max(1, (seqlen_k + tile_n - 1) // tile_n)
+    for n in range(num_n):
+        m_block_max = (seqlen_q + tile_m - 1) // tile_m
+        m_block_min = 0
+        if causal or (window_left is not None and window_right is not None):
+            m_idx = n * tile_n + seqlen_q - seqlen_k
+            m_idx_right = m_idx if causal else m_idx - window_right
+            m_block_min = max(m_block_min, m_idx_right // tile_m)
+        if window_left is not None:
+            m_idx_left = (n + 1) * tile_n + seqlen_q - seqlen_k + window_left
+            m_block_max = min(m_block_max, (m_idx_left + tile_m - 1) // tile_m)
+        counts.append(max(0, m_block_max - m_block_min))
+    return counts
+
+
+@functools.lru_cache(maxsize=256)
+def _build_bwd_work_table_cached(seqlen_q, seqlen_k, tile_m, tile_n, causal, window_left,
+                                 window_right, chunk, device):
+    import torch
+
+    rows = []
+    for n, m_blocks in enumerate(
+        causal_m_block_counts(seqlen_q, seqlen_k, tile_m, tile_n, causal, window_left,
+                              window_right)
+    ):
+        for c in range((m_blocks + chunk - 1) // chunk):
+            rows.append((n, c))
+    if not rows:
+        rows.append((0, 0))
+    return torch.tensor(rows, dtype=torch.int32, device=device)
+
+
+def build_bwd_work_table(seqlen_q, seqlen_k, tile_m, tile_n, causal, window_left,
+                         window_right, chunk, device):
+    """(n_block, chunk_index) per CTA for the backward, one (batch, head)'s worth.
+
+    The backward parallelizes over KV blocks rather than query tiles, so the causal
+    triangle is mirrored: KV block n is attended by the query tiles at or after it, and
+    one CTA per KV block means the first does N query tiles and the last does one. Same
+    fix as the forward, transposed -- a constant `chunk` query tiles per CTA, and as many
+    CTAs per KV block as it needs. dK and dV then have to be aggregated with atomic_add,
+    which is the path FA4 already keeps for GQA.
+    """
+    return _build_bwd_work_table_cached(
+        int(seqlen_q), int(seqlen_k), int(tile_m), int(tile_n), bool(causal),
+        None if window_left is None else int(window_left),
+        None if window_right is None else int(window_right),
+        int(chunk), str(device),
+    )

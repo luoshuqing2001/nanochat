@@ -45,6 +45,29 @@ def auto_balanced_chunk(batch, num_head, seqlen_q, seqlen_k, causal=True, window
     return max(1, min(chunk, max(counts) if counts else 1))
 
 
+def auto_bwd_m_chunk(batch, num_head, seqlen_q, seqlen_k, causal=True, window_left=None,
+                     window_right=None, tile_m=64, tile_n=128, device=None):
+    """Query tiles per CTA for the balanced *backward*, or None to leave it off.
+
+    The backward parallelizes over KV blocks, so the same triangular imbalance appears
+    mirrored, and the same trade applies: balancing it means dK and dV go through
+    fp32 accumulators and a conversion pass, which at training shapes costs far more
+    than the imbalance is worth (B8 T2048 H12: 6.894 -> 9.030 ms at an identical CTA
+    count). Only worth it when one CTA per KV block leaves the machine idle.
+    """
+    sms = torch.cuda.get_device_properties(device or 0).multi_processor_count
+    num_n = max(1, (seqlen_k + tile_n - 1) // tile_n)
+    if batch * num_head * num_n >= _SPLIT_TARGET_PROGRAMS_PER_SM * sms:
+        return None
+    from flash_attn_4.balanced_scheduler import causal_m_block_counts
+
+    counts = causal_m_block_counts(seqlen_q, seqlen_k, tile_m, tile_n, causal,
+                                   window_left, window_right)
+    total = batch * num_head * sum(counts)
+    chunk = max(1, int(total // (_BALANCED_TARGET_CTAS_PER_SM * sms)))
+    return max(1, min(chunk, max(counts) if counts else 1))
+
+
 def auto_num_splits(batch, num_head, seqlen_q, seqlen_k, tile_m=128, device=None):
     """How many splits to use, or 1 to leave the split path off.
 
@@ -148,7 +171,8 @@ def softplus_attn_fa4(
 
 @torch.library.custom_op("softplus_attn_fa4::fwd", mutates_args=(), device_types="cuda")
 def _op_fwd_fa4(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                window: int, alpha: float, scale: float, splits: int) -> torch.Tensor:
+                window: int, alpha: float, scale: float, splits: int,
+                m_chunk: int) -> torch.Tensor:
     from flash_attn_4.interface import _flash_attn_fwd
 
     left = None if window < 0 else window
@@ -165,14 +189,14 @@ def _op_fwd_fa4(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 
 
 @_op_fwd_fa4.register_fake
-def _(q, k, v, window, alpha, scale, splits):
+def _(q, k, v, window, alpha, scale, splits, m_chunk):
     return torch.empty_like(q)
 
 
 @torch.library.custom_op("softplus_attn_fa4::bwd", mutates_args=(), device_types="cuda")
 def _op_bwd_fa4(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor,
-                do: torch.Tensor, window: int, alpha: float,
-                scale: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                do: torch.Tensor, window: int, alpha: float, scale: float,
+                m_chunk: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from flash_attn_4.interface import _flash_attn_bwd
 
     left = None if window < 0 else window
@@ -183,27 +207,28 @@ def _op_bwd_fa4(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Te
         softmax_scale=scale, causal=left is None,
         window_size_left=left, window_size_right=0 if left is not None else None,
         attn_kind="softplus", softplus_alpha=alpha,
+        softplus_balanced_m_chunk=None if m_chunk <= 0 else m_chunk,
     )
     return dq, dk, dv
 
 
 @_op_bwd_fa4.register_fake
-def _(q, k, v, out, do, window, alpha, scale):
+def _(q, k, v, out, do, window, alpha, scale, m_chunk):
     return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
 
 def _setup_context_fa4(ctx, inputs, output):
-    q, k, v, window, alpha, scale, _splits = inputs
+    q, k, v, window, alpha, scale, _splits, m_chunk = inputs
     ctx.save_for_backward(q, k, v, output)
-    ctx.window, ctx.alpha, ctx.scale = window, alpha, scale
+    ctx.window, ctx.alpha, ctx.scale, ctx.m_chunk = window, alpha, scale, m_chunk
 
 
 def _backward_fa4(ctx, do):
     q, k, v, out = ctx.saved_tensors
     dq, dk, dv = torch.ops.softplus_attn_fa4.bwd(
-        q, k, v, out, do, ctx.window, ctx.alpha, ctx.scale
+        q, k, v, out, do, ctx.window, ctx.alpha, ctx.scale, ctx.m_chunk
     )
-    return dq, dk, dv, None, None, None, None
+    return dq, dk, dv, None, None, None, None, None
 
 
 torch.library.register_autograd(
@@ -212,7 +237,7 @@ torch.library.register_autograd(
 
 
 def softplus_attn_fa4_func(q, k, v, causal=True, window_size=(None, None),
-                           alpha=1.0, softmax_scale=None, num_splits=1):
+                           alpha=1.0, softmax_scale=None, num_splits=1, bwd_m_chunk="auto"):
     """Differentiable softplus attention, forward and backward both in CuTe.
 
     `num_splits` > 1 splits the forward's key range and aggregates with atomic_add; the
@@ -226,5 +251,11 @@ def softplus_attn_fa4_func(q, k, v, causal=True, window_size=(None, None),
     assert right in (0, None), "only a zero right window is supported"
     window = -1 if left is None or left < 0 or left >= k.size(1) else int(left)
     scale = q.shape[-1] ** -0.5 if softmax_scale is None else float(softmax_scale)
+    if bwd_m_chunk == "auto":
+        bwd_m_chunk = auto_bwd_m_chunk(
+            q.shape[0], q.shape[2], q.shape[1], k.shape[1],
+            causal=window < 0, window_left=None if window < 0 else window,
+            window_right=None if window < 0 else 0,
+        ) or 0
     return torch.ops.softplus_attn_fa4.fwd(q, k, v, window, float(alpha), scale,
-                                           int(num_splits))
+                                           int(num_splits), int(bwd_m_chunk))

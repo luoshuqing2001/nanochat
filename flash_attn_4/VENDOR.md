@@ -224,6 +224,32 @@ and 3.875e-03 against the float32 reference either way. One `log2` becomes five 
 
 `FA4_SOFTPLUS_EXACT=1` restores the `log2` form for a reference run.
 
+### The same schedule in the backward
+
+The backward is the forward's mirror: its grid is one CTA per *KV* block, and under a
+causal mask KV block n is attended by the query tiles at or after it, so the first CTA
+does N query tiles and the last does one -- 32:2 at B8 T2048 H12, the same 16:1 spread.
+`balanced_m_chunk=C` gives every CTA a constant C query tiles and each KV block as many
+CTAs as it needs. dK and dV then have to be aggregated, which turns on the fp32
+accumulate-and-convert path FA4 already keeps for GQA; dQ was atomic all along.
+
+| | FA4 softmax | unsplit softplus | chunk=8 | chunk=16 | chunk=32 |
+|---|---|---|---|---|---|
+| B8 T2048 H12 causal | 6.886 | **6.894** | 9.419 | 9.028 | 9.030 ms |
+| B8 T2048 H12 W=512 | 4.661 | **4.265** | 8.007 | 7.821 | 7.846 ms |
+| B1 T8192 H1 causal | 0.919 | 0.987 | 0.924 | 0.896 | **0.871 ms** |
+| B1 T4096 H2 causal | 0.482 | **0.519** | 0.540 | 0.524 | 0.528 ms |
+
+Same verdict as the forward, and the `chunk=32` column isolates it the same way: at the
+training shapes every KV block needs one CTA at that chunk size, so the schedule, the
+CTA count and the total work are identical to the unsplit row, and it is still 31%
+slower on the causal layer and 84% on the windowed one. That is dK and dV moving to
+fp32 accumulators plus a conversion pass. At B1 T8192 H1 the balance is worth having:
+0.987 -> 0.871 ms, 1.13x, and it beats softmax's 0.919 too.
+
+`auto_bwd_m_chunk` applies the same gate as the forward and returns None at any
+training shape. The training path therefore runs the backward unsplit.
+
 ### The backward's score map is already within 2-4% of its floor
 
 Worth checking whether the same trick is owed to the backward, which is four fifths of

@@ -2007,6 +2007,7 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     attn_kind: str = "softmax",
     softplus_alpha: float = 1.0,
+    softplus_balanced_m_chunk: Optional[int] = None,
     dlse: Optional[torch.Tensor] = None,
     learnable_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, ...]:
@@ -2334,7 +2335,25 @@ def _flash_attn_bwd(
     # accumulate into the same dK/dV. SM90 varlen_k with qhead_per_kvhead==1 now uses
     # ragged TMA tensors for direct store, so no longer needs accum+postprocess.
     # hd=256 2CTA backward has its own internal postprocess for dK/dV.
-    dKV_postprocess = qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel
+    # LOCAL PATCH (nanochat): balanced scheduling for the backward. Constant query tiles
+    # per CTA means several CTAs share a KV block, so dK/dV need the accumulate-and-
+    # convert path that GQA already uses.
+    bwd_work_table = None
+    if softplus_balanced_m_chunk is not None:
+        assert attn_kind == "softplus", "balanced backward scheduling is softplus-only"
+        assert not is_varlen, "balanced backward scheduling does not support varlen yet"
+        from flash_attn_4.balanced_scheduler import build_bwd_work_table
+
+        bwd_work_table = build_bwd_work_table(
+            seqlen_q, seqlen_k, m_block_size, n_block_size, causal or local,
+            window_size_left if local else None, window_size_right if local else None,
+            softplus_balanced_m_chunk, device,
+        )
+    bwd_work_table_tensor = to_cute_tensor(bwd_work_table, assumed_align=4, leading_dim=1)
+
+    dKV_postprocess = (
+        qhead_per_kvhead > 1 or softplus_balanced_m_chunk is not None
+    ) and not use_dedicated_hd256_kernel
     if dKV_postprocess:
         # Same rounding as the kernel's tile_hdimv and the postprocess (64 with dKV_swapAB on
         # SM90): the GQA epilogue reduces tile_n * tile_hdimv fp32 values per block.
@@ -2533,6 +2552,7 @@ def _flash_attn_bwd(
             single_k_block,
             cu_total_m_blocks_k is not None,
             attn_kind,
+            softplus_balanced_m_chunk,
         )
     else:
         compile_key = (
@@ -2577,6 +2597,7 @@ def _flash_attn_bwd(
             use_dedicated_hd256_kernel and cu_seqlens_q is not None and max_seqlen_q is None,
             use_dedicated_hd256_kernel and cu_seqlens_k is not None and max_seqlen_k is None,
             attn_kind,
+            softplus_balanced_m_chunk,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -2610,8 +2631,10 @@ def _flash_attn_bwd(
                     FlashAttentionBackwardSm120Softplus if arch // 10 == 12
                     else FlashAttentionBackwardSm80Softplus
                 )
+                bwd_extra_kwargs = dict(balanced_m_chunk=softplus_balanced_m_chunk)
             else:
                 flash_bwd_obj_cls = FlashAttentionBackwardSm120 if arch // 10 == 12 else FlashAttentionBackwardSm80
+                bwd_extra_kwargs = {}
             fa_bwd_obj = flash_bwd_obj_cls(
                 dtype,
                 head_dim,
@@ -2634,6 +2657,7 @@ def _flash_attn_bwd(
                 V_in_regs=V_in_regs,
                 score_mod=score_mod,
                 score_mod_bwd=score_mod_bwd,
+                **bwd_extra_kwargs,
             )
         elif arch // 10 == 9:
             assert attn_kind == "softmax", "softplus bwd is SM80/SM120 only so far"
@@ -2749,7 +2773,7 @@ def _flash_attn_bwd(
             sparse_tensors_compile,
         ]
         if not use_dedicated_hd256_kernel:
-            compile_args.append(cu_total_m_blocks_k_tensor)
+            compile_args.extend([cu_total_m_blocks_k_tensor, bwd_work_table_tensor])
         else:
             compile_args.extend(
                 (
@@ -2804,7 +2828,7 @@ def _flash_attn_bwd(
             else None,
         ]
         if not use_dedicated_hd256_kernel:
-            call_args.append(cu_total_m_blocks_k)
+            call_args.extend([cu_total_m_blocks_k, bwd_work_table])
         else:
             call_args.extend(
                 (

@@ -29,6 +29,16 @@ from flash_attn_4.utils import AuxData
 
 
 class FlashAttentionBackwardSm80:
+    # LOCAL PATCH (nanochat): balanced scheduling for the backward. The grid is one CTA
+    # per KV block, and under a causal mask KV block n is attended by the query tiles at
+    # or after it, so the first CTA does N query tiles and the last does one. These give
+    # a constant m_blocks_per_chunk query tiles per CTA instead, with as many CTAs per KV
+    # block as it needs; dK/dV then aggregate through the atomic path FA4 already keeps
+    # for GQA. All three defaults leave upstream's scheduling untouched.
+    tile_scheduler_cls = None
+    m_blocks_per_chunk = None
+    dkv_atomic = False
+
     def __init__(
         self,
         dtype: Type[cutlass.Numeric],
@@ -166,7 +176,7 @@ class FlashAttentionBackwardSm80:
     ):
         if cutlass.const_expr(not (mQ_type == mK_type == mV_type == mdO_type)):
             raise TypeError("All tensors must have the same data type")
-        if cutlass.const_expr(self.qhead_per_kvhead == 1):
+        if cutlass.const_expr(self.qhead_per_kvhead == 1 and not self.dkv_atomic):
             if cutlass.const_expr(not (mdK_type == mdV_type == mQ_type)):
                 raise TypeError("mdK and mdV tensors must have the same data type as mQ")
         else:
@@ -303,7 +313,7 @@ class FlashAttentionBackwardSm80:
             cute.make_layout(self.num_threads),
             cute.make_layout(1)
         )
-        if cutlass.const_expr(self.qhead_per_kvhead > 1):
+        if cutlass.const_expr(self.qhead_per_kvhead > 1 or self.dkv_atomic):
             self.gmem_tiled_copy_dK = self.gmem_tiled_copy_dQaccum
             self.gmem_tiled_copy_dV = self.gmem_tiled_copy_dQaccum
 
@@ -395,6 +405,7 @@ class FlashAttentionBackwardSm80:
         aux_data: AuxData = AuxData(),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        mWorkTable: Optional[cute.Tensor] = None,  # LOCAL PATCH (nanochat)
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -420,6 +431,8 @@ class FlashAttentionBackwardSm80:
         else:
             TileScheduler = SingleTileScheduler
             num_batch = mK.shape[0]
+        if cutlass.const_expr(self.tile_scheduler_cls is not None):
+            TileScheduler = self.tile_scheduler_cls  # LOCAL PATCH (nanochat)
 
         # Uses seqlen k, etc. since main bwd kernel's blocks are over n
         tile_sched_args = TileSchedulerArguments(
@@ -436,6 +449,7 @@ class FlashAttentionBackwardSm80:
             mCuSeqlensQ=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedK,
             cu_total_m_blocks_ptr=mCuTotalMBlocks,
+            work_table=mWorkTable,  # LOCAL PATCH (nanochat)
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
@@ -536,7 +550,7 @@ class FlashAttentionBackwardSm80:
         tile_scheduler = TileScheduler.create(tile_sched_params)
         work_tile = tile_scheduler.initial_work_tile_info()
 
-        n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+        n_block, head_idx, batch_idx, chunk_idx = work_tile.tile_idx
 
         if work_tile.is_valid_tile:
             seqlen = SeqlenInfoQK.create(
@@ -561,6 +575,11 @@ class FlashAttentionBackwardSm80:
                 window_size_right,
             )
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
+            # LOCAL PATCH (nanochat): this CTA's slice of the query range. The guard below
+            # already handles an empty one, and the epilogue then atomically adds zeros.
+            if cutlass.const_expr(self.m_blocks_per_chunk is not None):
+                m_block_min = m_block_min + chunk_idx * self.m_blocks_per_chunk
+                m_block_max = cutlass.min(m_block_min + self.m_blocks_per_chunk, m_block_max)
             # TODO: return early if m_block_max == 0
 
             # ///////////////////////////////////////////////////////////////////////////////
@@ -867,7 +886,8 @@ class FlashAttentionBackwardSm80:
             # Epilogue
             # ///////////////////////////////////////////////////////////////////////////////
             # If GQA, we scale dK in the postprocessing kernel instead
-            if cutlass.const_expr(self.qhead_per_kvhead == 1):
+            # LOCAL PATCH (nanochat): the atomic path scales dK in the postprocess, as GQA does.
+            if cutlass.const_expr(self.qhead_per_kvhead == 1 and not self.dkv_atomic):
                 acc_dK.store(acc_dK.load() * softmax_scale)
             # reuse sK and sV data iterator
             sdK = cute.make_tensor(sK.iterator, sK_layout)
@@ -1120,7 +1140,7 @@ class FlashAttentionBackwardSm80:
         batch_idx = batch_size
         head_idx_kv = num_head // self.qhead_per_kvhead if cutlass.const_expr(not self.pack_gqa) else num_head
 
-        if cutlass.const_expr(self.qhead_per_kvhead == 1):
+        if cutlass.const_expr(self.qhead_per_kvhead == 1 and not self.dkv_atomic):
             # Make sure all threads have finished reading K and V, otherwise we get racy dQ
             # because smem_q could be changed.
             cute.arch.barrier()
@@ -1194,7 +1214,7 @@ class FlashAttentionBackwardSm80:
                         pred=tdVpdV[None, rest_m, None] if cutlass.const_expr(self.check_hdim_v_oob) else None,
                     )
 
-        else:  # qhead_per_kvhead > 1, do atomic add
+        else:  # qhead_per_kvhead > 1 or dkv_atomic, do atomic add
             # For Sm90, we need to sync to avoid racy writes to smem_q
             # For Sm80, we don't need to sync since we're not touching smem
             head_idx_kv = num_head // self.qhead_per_kvhead if cutlass.const_expr(not self.pack_gqa) else num_head
