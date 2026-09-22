@@ -66,10 +66,16 @@ def _fwd_kernel(
     Q, K, V, O,
     sqb, sqt, sqh, skb, skt, skh, svb, svt, svh, sob, sot, soh,
     T, scale, alpha,
-    WINDOW: tl.constexpr, HEAD_DIM: tl.constexpr,
+    REVERSE: tl.constexpr, WINDOW: tl.constexpr, HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
+    if REVERSE:
+        # Causal work grows with the query index, so the last tiles are the long ones;
+        # issuing them first leaves only short tiles in the tail. Free -- an index
+        # permutation, bit-identical results -- and worth 17% when there are too few
+        # programs for the scheduler to hide the imbalance. See _reverse_tiles().
+        pid_m = tl.num_programs(0) - 1 - pid_m
     off_b = tl.program_id(1)
     off_h = tl.program_id(2)
 
@@ -123,7 +129,7 @@ def _bwd_kv_kernel(
     Q, K, V, DO, DK, DV,
     sqb, sqt, sqh, skb, skt, skh, svb, svt, svh, sdob, sdot, sdoh,
     T, scale, alpha,
-    WINDOW: tl.constexpr, HEAD_DIM: tl.constexpr,
+    REVERSE: tl.constexpr, WINDOW: tl.constexpr, HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     """One program per key tile: dK_j = scale * sum_i dS_ij q_i, dV_j = sum_i c_i P_ij dO_i."""
@@ -182,11 +188,13 @@ def _bwd_q_kernel(
     Q, K, V, DO, DQ,
     sqb, sqt, sqh, skb, skt, skh, svb, svt, svh, sdob, sdot, sdoh,
     T, scale, alpha,
-    WINDOW: tl.constexpr, HEAD_DIM: tl.constexpr,
+    REVERSE: tl.constexpr, WINDOW: tl.constexpr, HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     """One program per query tile: dQ_i = scale * sum_j dS_ij k_j."""
     pid_m = tl.program_id(0)
+    if REVERSE:
+        pid_m = tl.num_programs(0) - 1 - pid_m
     off_b = tl.program_id(1)
     off_h = tl.program_id(2)
 
@@ -325,6 +333,23 @@ def _fwd_splitk(q, k, v, window, alpha, scale, splits):
     return (o32 * n.pow(-alpha)[None, :, None, None]).to(q.dtype)
 
 
+_SM_COUNT = None
+
+
+def _reverse_tiles(programs):
+    """Whether to issue query tiles longest-first.
+
+    Only matters when there are too few programs for the scheduler to interleave long and
+    short tiles across waves. Measured on a GB10 (48 SMs), full-context forward:
+    B1 T8192 H1 (128 programs) 0.57 -> 0.47 ms, while B8 T2048 H10 (2560 programs) and
+    B64 T2048 H10 (20480) each lose about 3%, presumably L2 locality. Results are
+    bit-identical either way, so this only ever trades time."""
+    global _SM_COUNT
+    if _SM_COUNT is None:
+        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
+    return programs < 3 * _SM_COUNT
+
+
 def _fwd_config(window):
     """Launch configuration, swept on a GB10 at B8 T2048 H10 D128 bf16.
 
@@ -350,120 +375,9 @@ def _fwd(q, k, v, window, alpha, scale):
         v.stride(0), v.stride(1), v.stride(2),
         o.stride(0), o.stride(1), o.stride(2),
         T, scale, alpha,
-        WINDOW=window, HEAD_DIM=D, **cfg,
+        REVERSE=_reverse_tiles(grid[0] * B * H), WINDOW=window, HEAD_DIM=D, **cfg,
     )
     return o
-
-
-@triton.jit
-def _bwd_kv_kernel(
-    Q, K, V, DO, DK, DV,
-    sqb, sqt, sqh, skb, skt, skh, svb, svt, svh, sdob, sdot, sdoh,
-    T, scale, alpha,
-    WINDOW: tl.constexpr, HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-):
-    """One program per key tile: dK_j = scale * sum_i dS_ij q_i, dV_j = sum_i c_i P_ij dO_i."""
-    pid_n = tl.program_id(0)
-    off_b = tl.program_id(1)
-    off_h = tl.program_id(2)
-
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, HEAD_DIM)
-
-    k = tl.load(K + off_b * skb + off_h * skh + offs_n[:, None] * skt + offs_d[None, :],
-                mask=offs_n[:, None] < T, other=0.0)
-    v = tl.load(V + off_b * svb + off_h * svh + offs_n[:, None] * svt + offs_d[None, :],
-                mask=offs_n[:, None] < T, other=0.0)
-    dk = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
-    dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
-
-    # causal: only queries at or after this key tile; window: not past j + WINDOW
-    lo = (pid_n * BLOCK_N // BLOCK_M) * BLOCK_M
-    hi = T
-    if WINDOW >= 0:
-        hi = tl.minimum(T, (pid_n + 1) * BLOCK_N + WINDOW)
-
-    for start_m in range(lo, hi, BLOCK_M):
-        offs_m = start_m + tl.arange(0, BLOCK_M)
-        q = tl.load(Q + off_b * sqb + off_h * sqh + offs_m[:, None] * sqt + offs_d[None, :],
-                    mask=offs_m[:, None] < T, other=0.0)
-        do = tl.load(DO + off_b * sdob + off_h * sdoh + offs_m[:, None] * sdot + offs_d[None, :],
-                     mask=offs_m[:, None] < T, other=0.0)
-
-        s = tl.dot(q, tl.trans(k)) * scale
-        keep = (offs_n[None, :] <= offs_m[:, None]) & (offs_n[None, :] < T) & (offs_m[:, None] < T)
-        if WINDOW >= 0:
-            keep = keep & ((offs_m[:, None] - offs_n[None, :]) <= WINDOW)
-
-        n = offs_m + 1
-        if WINDOW >= 0:
-            n = tl.minimum(n, WINDOW + 1)
-        c = tl.exp(-alpha * tl.log(n.to(tl.float32)))[:, None]      # (BLOCK_M, 1)
-
-        p = tl.where(keep, _softplus(s), 0.0) * c                    # c folded in for dV
-        dv += tl.dot(tl.trans(p).to(do.dtype), do)
-
-        dp = tl.dot(do, tl.trans(v)) * c                             # (BLOCK_M, BLOCK_N)
-        ds = tl.where(keep, dp * tl.sigmoid(s), 0.0)
-        dk += tl.dot(tl.trans(ds).to(q.dtype), q) * scale
-
-    tl.store(DK + off_b * skb + off_h * skh + offs_n[:, None] * skt + offs_d[None, :],
-             dk.to(DK.dtype.element_ty), mask=offs_n[:, None] < T)
-    tl.store(DV + off_b * svb + off_h * svh + offs_n[:, None] * svt + offs_d[None, :],
-             dv.to(DV.dtype.element_ty), mask=offs_n[:, None] < T)
-
-
-@triton.jit
-def _bwd_q_kernel(
-    Q, K, V, DO, DQ,
-    sqb, sqt, sqh, skb, skt, skh, svb, svt, svh, sdob, sdot, sdoh,
-    T, scale, alpha,
-    WINDOW: tl.constexpr, HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-):
-    """One program per query tile: dQ_i = scale * sum_j dS_ij k_j."""
-    pid_m = tl.program_id(0)
-    off_b = tl.program_id(1)
-    off_h = tl.program_id(2)
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, HEAD_DIM)
-
-    q = tl.load(Q + off_b * sqb + off_h * sqh + offs_m[:, None] * sqt + offs_d[None, :],
-                mask=offs_m[:, None] < T, other=0.0)
-    do = tl.load(DO + off_b * sdob + off_h * sdoh + offs_m[:, None] * sdot + offs_d[None, :],
-                 mask=offs_m[:, None] < T, other=0.0)
-    dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-
-    n = offs_m + 1
-    if WINDOW >= 0:
-        n = tl.minimum(n, WINDOW + 1)
-    c = tl.exp(-alpha * tl.log(n.to(tl.float32)))[:, None]
-
-    hi = tl.minimum((pid_m + 1) * BLOCK_M, T)
-    lo = 0
-    if WINDOW >= 0:
-        lo = tl.maximum(0, pid_m * BLOCK_M - WINDOW)
-        lo = (lo // BLOCK_N) * BLOCK_N
-
-    for start_n in range(lo, hi, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        k = tl.load(K + off_b * skb + off_h * skh + offs_n[:, None] * skt + offs_d[None, :],
-                    mask=offs_n[:, None] < T, other=0.0)
-        v = tl.load(V + off_b * svb + off_h * svh + offs_n[:, None] * svt + offs_d[None, :],
-                    mask=offs_n[:, None] < T, other=0.0)
-
-        s = tl.dot(q, tl.trans(k)) * scale
-        keep = (offs_n[None, :] <= offs_m[:, None]) & (offs_n[None, :] < T)
-        if WINDOW >= 0:
-            keep = keep & ((offs_m[:, None] - offs_n[None, :]) <= WINDOW)
-        dp = tl.dot(do, tl.trans(v)) * c
-        ds = tl.where(keep, dp * tl.sigmoid(s), 0.0)
-        dq += tl.dot(ds.to(k.dtype), k) * scale
-
-    tl.store(DQ + off_b * sqb + off_h * sqh + offs_m[:, None] * sqt + offs_d[None, :],
-             dq.to(DQ.dtype.element_ty), mask=offs_m[:, None] < T)
 
 
 def _bwd(q, k, v, do, window, alpha, scale, BLOCK_M=64, BLOCK_N=64):
@@ -483,8 +397,13 @@ def _bwd(q, k, v, do, window, alpha, scale, BLOCK_M=64, BLOCK_N=64):
     # accumulators at once).
     kw = dict(WINDOW=window, HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
               num_warps=8, num_stages=2)
-    _bwd_kv_kernel[(triton.cdiv(T, BLOCK_N), B, H)](q, k, v, do, dk, dv, *args, **kw)
-    _bwd_q_kernel[(triton.cdiv(T, BLOCK_M), B, H)](q, k, v, do, dq, *args, **kw)
+    # dK/dV work shrinks with the key index -- key tile 0 is read by every query tile --
+    # so that kernel is already longest-first. dQ grows like the forward.
+    _bwd_kv_kernel[(triton.cdiv(T, BLOCK_N), B, H)](q, k, v, do, dk, dv, *args,
+                                                    REVERSE=False, **kw)
+    _bwd_q_kernel[(triton.cdiv(T, BLOCK_M), B, H)](
+        q, k, v, do, dq, *args,
+        REVERSE=_reverse_tiles(triton.cdiv(T, BLOCK_M) * B * H), **kw)
     return dq, dk, dv
 
 
