@@ -217,6 +217,8 @@ class TileSchedulerArguments(ParamsBase):
     blocks_to_batch_idx_ptr: Optional[cute.Tensor] = None
     tile_count_semaphore: Optional[cute.Pointer] = None
     persistent_cta_multiplier: cutlass.Constexpr[int] = 1
+    # LOCAL PATCH (nanochat): (m_block, chunk_index) per CTA for BalancedCausalScheduler.
+    work_table: Optional[cute.Tensor] = None
 
 
 class SingleTileScheduler:

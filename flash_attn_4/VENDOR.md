@@ -249,7 +249,8 @@ few query-tile programs to fill the GPU:
 | T 16384 | 1.336 ms | 1.131 | **1.075** | 1.088 | 1.224 |
 
 1.24x to 1.54x, best at S=4, and the optimum turns over by S=16 -- the classic split-K
-shape. At training shapes it loses badly, and the decomposition says why
+shape. (These are uniform splitting; the balanced schedule above supersedes it.) At
+training shapes it loses badly, and the decomposition says why
 (B8 T2048 H12 D128, full causal):
 
 | | |
@@ -301,22 +302,62 @@ Two reasons, and it is worth separating them because only the first is about sof
   final wave, about 1/64. Splitting then adds 64x more programs, fp32 output writes,
   atomic contention and a zero-and-cast pass to chase it.
 
+### A better schedule: constant work per CTA
+
+Uniform splitting asks the wrong question. It fixes the *number of CTAs per query tile*
+and lets their work vary; the fix is to fix the *work per CTA* and let the number of
+CTAs vary. `balanced_chunk=C` gives every CTA exactly C key blocks and gives query tile
+m however many CTAs its range needs, `ceil(n_blocks(m) / C)`. Then no CTA is empty, no
+work is wasted, and the longest CTA is C blocks whatever the query tile.
+`balanced_scheduler.py` builds the (m_block, chunk_index) table on the host -- one entry
+per CTA for a single (batch, head), a few dozen at training shapes -- and
+`BlockInfo.num_n_blocks_per_split`, which upstream already had, turns chunk_index into
+the key range. The table is LRU-cached: during decode this is called once per layer per
+token against a 30-microsecond kernel.
+
+It is strictly the better schedule. B8 T2048 H12 D128 full causal, forward:
+
+| | time | CTAs |
+|---|---|---|
+| baseline, one CTA per query tile | **1.727 ms** | 1536 |
+| uniform split S=2 / S=4 / S=8 | 3.383 / 3.858 / 5.076 ms | 3072 / 6144 / 12288 |
+| balanced chunk=8 / 16 / 32 | 3.483 / 3.261 / **3.203 ms** | 3840 / 2304 / 1536 |
+
+and at low occupancy (B1 T8192 H1) balanced chunk=32 reaches 1.50x against uniform's
+best 1.39x.
+
+But read the `chunk=32` row: at this shape no query tile has more than 32 key blocks, so
+every tile gets exactly one CTA and the schedule, the CTA count and the total work are
+*identical to the baseline*. It is still 1.85x slower. That isolates the cost cleanly:
+**the 1.48 ms is the atomic aggregation, not the scheduling.** An fp32 destination is 4x
+the write traffic of bf16, it has to be zeroed first, and it has to be cast back.
+
+bf16 atomics would remove all three, and they are correct (identical error to fp32), but
+scalar bf16 `atomic_add` lowers to a slow path on SM120 -- 18.3 ms against fp32's 4.1 ms
+at chunk=4. Dead end.
+
+So the scheduling idea is right and is now the default wherever aggregation is worth
+paying for at all. It just cannot pay for itself at training shapes, where the imbalance
+it removes is worth at most a few percent (the longest CTA is 32 blocks against 1088
+blocks of work per SM) and the aggregation costs 86%.
+
 ### Where splitting does pay: long-context inference
 
-`num_splits="auto"` calls `auto_num_splits`, which counts query-tile programs against
-the SM count and splits only when the machine would otherwise sit idle. Forward only,
-one sequence, GB10:
+`num_splits="auto"` calls `auto_balanced_chunk`, which declines unless one CTA per query
+tile would leave the machine idle, and otherwise picks the chunk that fills it about
+twice over -- more CTAs than that is just more atomics. Forward only, one sequence,
+GB10; the s= columns are uniform splitting for comparison:
 
-| | s=1 | s=2 | s=4 | s=8 | auto |
+| | s=1 | s=2 | s=4 | s=8 | auto (balanced) |
 |---|---|---|---|---|---|
-| prefill H1 T4096 | 0.193 | 0.124 | 0.116 | 0.130 | s=5, **1.70x** |
-| prefill H1 T8192 | 0.447 | 0.351 | 0.322 | 0.338 | s=3, 1.40x |
-| prefill H1 T16384 | 1.337 | 1.125 | 1.096 | 1.112 | s=2, 1.20x |
-| prefill H12 T8192 | 3.153 | 3.673 | 3.934 | 4.282 | s=1, 1.00x |
-| decode H6 Tk4096 | 0.181 | 0.088 | 0.049 | 0.030 | s=8, **6.00x** |
-| decode H6 Tk16384 | 0.748 | 0.375 | 0.294 | 0.291 | s=8, 2.59x |
-| decode H6 Tk65536 | 2.954 | 1.456 | 1.196 | 1.065 | s=8, 2.79x |
-| decode H12 Tk65536 | 3.110 | 2.478 | 2.314 | 2.175 | s=8, 1.51x |
+| prefill H1 T4096 | 0.181 | 0.123 | 0.127 | 0.128 | chunk 11, **1.84x** |
+| prefill H1 T8192 | 0.447 | 0.346 | 0.321 | 0.342 | chunk 43, 1.49x |
+| prefill H1 T16384 | 1.334 | 1.106 | 1.077 | 1.101 | chunk 172, 1.16x |
+| prefill H12 T8192 | 3.153 | 3.440 | 3.648 | 4.092 | none, 0.99x |
+| decode H6 Tk4096 | 0.181 | 0.089 | 0.050 | 0.031 | chunk 4, **5.66x** |
+| decode H6 Tk16384 | 0.724 | 0.334 | 0.243 | 0.233 | chunk 16, 3.09x |
+| decode H6 Tk65536 | 2.872 | 1.319 | 0.905 | 0.883 | chunk 64, 3.04x |
+| decode H12 Tk65536 | 2.941 | 1.782 | 1.720 | 1.716 | chunk 128, 1.63x |
 
 Decode is the case the idea was made for: one query token against a long cache is a
 handful of programs on 48 SMs, and splitting the key range is the only parallelism

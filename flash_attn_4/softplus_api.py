@@ -5,6 +5,7 @@ classes from there, so the wrapper that calls `interface` has to live elsewhere.
 """
 
 import math
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -15,6 +16,33 @@ import torch
 # Measured on GB10 (48 SMs): the optimum sits at 4 splits and turns over by 16.
 _SPLIT_TARGET_PROGRAMS_PER_SM = 3.0
 _SPLIT_MAX = 8
+
+# Balanced scheduling has a different optimum from uniform splitting: the cost is the
+# atomics, so the aim is to fill the machine and stop, not to keep subdividing.
+_BALANCED_TARGET_CTAS_PER_SM = float(os.environ.get("FA4_BALANCED_CTAS_PER_SM", "2.0"))
+
+
+def auto_balanced_chunk(batch, num_head, seqlen_q, seqlen_k, causal=True, window_left=None,
+                        tile_m=128, tile_n=64, device=None):
+    """Key blocks per CTA for the balanced scheduler, or None to leave it off.
+
+    Two decisions. Whether to aggregate at all: only when one CTA per query tile would
+    leave the machine idle, since the atomic accumulator costs a zeroing pass and fp32
+    output writes -- about 1.5 ms against a 1.7 ms kernel at training shapes, far more
+    than the few percent that perfect balance could recover there. Then how big a chunk:
+    enough CTAs to fill the machine a few times over, and no smaller, because every extra
+    CTA is another set of atomics.
+    """
+    sms = torch.cuda.get_device_properties(device or 0).multi_processor_count
+    num_m = max(1, (seqlen_q + tile_m - 1) // tile_m)
+    if batch * num_head * num_m >= _SPLIT_TARGET_PROGRAMS_PER_SM * sms:
+        return None
+    from flash_attn_4.balanced_scheduler import causal_block_counts
+
+    counts = causal_block_counts(seqlen_q, seqlen_k, tile_m, tile_n, causal, window_left)
+    total = batch * num_head * sum(counts)
+    chunk = max(1, int(total // (_BALANCED_TARGET_CTAS_PER_SM * sms)))
+    return max(1, min(chunk, max(counts) if counts else 1))
 
 
 def auto_num_splits(batch, num_head, seqlen_q, seqlen_k, tile_m=128, device=None):
@@ -47,6 +75,8 @@ def softplus_attn_fa4(
     alpha: float = 1.0,
     softmax_scale: Optional[float] = None,
     num_splits: Union[int, str] = 1,
+    balanced_chunk: Optional[int] = None,
+    atomic_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """Softplus attention forward: `O_i = n_i^-alpha * sum_j softplus(s_ij) v_j`.
 
@@ -73,12 +103,24 @@ def softplus_attn_fa4(
     assert right in (0, None), "only a zero right window is supported"
 
     if num_splits == "auto":
-        num_splits = auto_num_splits(q.shape[0], q.shape[2], q.shape[1], k.shape[1])
+        # "auto" means the balanced scheduler: a constant number of key blocks per CTA,
+        # which beats uniform splitting everywhere splitting is worth doing at all.
+        num_splits = 1
+        if balanced_chunk is None:
+            balanced_chunk = auto_balanced_chunk(
+                q.shape[0], q.shape[2], q.shape[1], k.shape[1],
+                causal=True, window_left=left,
+            )
 
     out = None
-    if num_splits > 1:
-        # The splits accumulate atomically, so the destination has to be fp32 and zeroed.
-        out = torch.zeros(*q.shape[:-1], v.shape[-1], dtype=torch.float32, device=q.device)
+    if balanced_chunk is not None:
+        num_splits = 1
+    if num_splits > 1 or balanced_chunk is not None:
+        # The CTAs accumulate atomically, so the destination has to be zeroed. float32 is
+        # the safe choice; q.dtype skips the workspace, its zeroing and the cast back, at
+        # the price of accumulating in bf16 across the CTAs sharing a query tile.
+        acc_dtype = atomic_dtype or torch.float32
+        out = torch.zeros(*q.shape[:-1], v.shape[-1], dtype=acc_dtype, device=q.device)
 
     o, *_ = _flash_attn_fwd(
         q, k, v,
@@ -89,9 +131,10 @@ def softplus_attn_fa4(
         attn_kind="softplus",
         softplus_alpha=float(alpha),
         softplus_num_splits=int(num_splits),
+        softplus_balanced_chunk=balanced_chunk,
         out=out,
     )
-    return o.to(q.dtype) if num_splits > 1 else o
+    return o.to(q.dtype) if out is not None and o.dtype != q.dtype else o
 
 
 # Registered as torch.library custom ops rather than a plain autograd.Function. Dynamo

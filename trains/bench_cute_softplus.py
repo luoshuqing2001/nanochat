@@ -7,7 +7,9 @@ import argparse, math, os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 
-from flash_attn_4.softplus_api import softplus_attn_fa4, softplus_attn_fa4_func, auto_num_splits
+from flash_attn_4.softplus_api import (
+    softplus_attn_fa4, softplus_attn_fa4_func, auto_num_splits, auto_balanced_chunk,
+)
 from flash_attn_4.interface import _flash_attn_fwd
 from nanochat.softplus_attention import softplus_attn_func
 
@@ -41,6 +43,7 @@ def bench_shape(B, T, H, D, W, splits_list):
 def bench_inference(splits_list):
     """Where tile splitting actually pays: one sequence, long context."""
     print("\n=== long-context inference, single sequence (fwd only) ===")
+    print("  columns are uniform splits; auto uses the balanced scheduler instead")
     print("  shape                        " + "".join(f"  s={s:<6}" for s in splits_list) + "   auto")
     for tag, B, Tq, Tk, H, D in [
         ("prefill H1  T4096",  1, 4096,  4096,  1, 128),
@@ -57,10 +60,10 @@ def bench_inference(splits_list):
         sc = 1.0 / math.sqrt(D)
         ms = [timeit(lambda s=s: softplus_attn_fa4(q, k, v, True, (None, 0), 1.0, sc, num_splits=s))
               for s in splits_list]
-        a = auto_num_splits(B, H, Tq, Tk)
+        a = auto_balanced_chunk(B, H, Tq, Tk)
         ams = timeit(lambda: softplus_attn_fa4(q, k, v, True, (None, 0), 1.0, sc, num_splits="auto"))
         print(f"  {tag:<28}" + "".join(f"{m:8.3f} " for m in ms)
-              + f"  s={a} {ms[0]/ams:.2f}x")
+              + f"  chunk={a} {ms[0]/ams:.2f}x")
 
 
 if __name__ == "__main__":

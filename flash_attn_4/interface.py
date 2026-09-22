@@ -589,6 +589,7 @@ def _flash_attn_fwd(
     attn_kind: str = "softmax",
     softplus_alpha: float = 1.0,
     softplus_num_splits: int = 1,
+    softplus_balanced_chunk: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -748,7 +749,9 @@ def _flash_attn_fwd(
             (*q_batch_seqlen_shape, num_head, head_dim_v),
             # The softplus split path atomically accumulates into out, so it must be a
             # zeroed fp32 buffer rather than the usual bf16 destination.
-            torch.float32 if softplus_num_splits > 1 else out_torch_dtype,
+            torch.float32
+            if (softplus_num_splits > 1 or softplus_balanced_chunk is not None) and out.dtype == torch.float32
+            else out_torch_dtype,
             device,
         )
         validate_output_layout(out, "out", align_bytes=16)
@@ -1234,7 +1237,27 @@ def _flash_attn_fwd(
         # unlike the softmax kernel where it is a runtime argument.
         window_size_left if attn_kind == "softplus" else None,
         softplus_num_splits,
+        softplus_balanced_chunk,
+        # The atomic paths can accumulate in fp32 or in the output dtype, which changes
+        # the kernel's mO type and so has to be part of the key.
+        out.dtype if attn_kind == "softplus" else None,
     )
+
+    # LOCAL PATCH (nanochat): work table for the balanced causal scheduler. One entry per
+    # CTA for a single (batch, head) -- a few dozen at training shapes -- shared by the
+    # whole grid. Rebuilt per call because it depends on the sequence lengths, but it is
+    # a handful of integers.
+    work_table = None
+    if softplus_balanced_chunk is not None:
+        assert attn_kind == "softplus", "balanced scheduling is softplus-only"
+        assert not is_varlen, "balanced scheduling does not support varlen yet"
+        from flash_attn_4.balanced_scheduler import build_work_table
+
+        work_table = build_work_table(
+            seqlen_q, seqlen_k, tile_m, tile_n, causal or local,
+            window_size_left if local else None, softplus_balanced_chunk, device,
+        )
+    work_table_tensor = to_cute_tensor(work_table, assumed_align=4, leading_dim=1)
 
     if compile_key not in _flash_attn_fwd.compile_cache:
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1325,6 +1348,7 @@ def _flash_attn_fwd(
                     window_size_left=window_size_left if local else None,
                     window_size_right=window_size_right if local else None,
                     num_splits=softplus_num_splits,
+                    balanced_chunk=softplus_balanced_chunk,
                 )
             fa_fwd = fwd_cls(
                 dtype,
@@ -1449,6 +1473,7 @@ def _flash_attn_fwd(
                     window_size_left=window_size_left if local else None,
                     window_size_right=window_size_right if local else None,
                     num_splits=softplus_num_splits,
+                    balanced_chunk=softplus_balanced_chunk,
                 )
             fa_fwd = fwd_cls(
                 dtype,
@@ -1542,6 +1567,7 @@ def _flash_attn_fwd(
                 compile_args.extend([
                     cu_total_m_blocks_tensor,
                     cu_total_splits_m_blocks_tensor,
+                    work_table_tensor,
                 ])
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
@@ -1638,6 +1664,7 @@ def _flash_attn_fwd(
                 call_args.extend([
                     cu_total_m_blocks,
                     cu_total_splits_m_blocks,
+                    work_table,
                 ])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:

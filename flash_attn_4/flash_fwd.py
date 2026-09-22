@@ -47,6 +47,11 @@ class FlashAttentionForwardBase:
     # Left at these defaults the const_expr folds the split path away entirely.
     is_split_kv = False
     num_splits = 1
+    # LOCAL PATCH (nanochat): a fixed number of key blocks per CTA instead of a fixed
+    # number of CTAs per query tile, and the scheduler that hands out that work. Both
+    # None leaves upstream's scheduling untouched. See balanced_scheduler.py.
+    n_blocks_per_split = None
+    tile_scheduler_cls = None
 
 
     def __init__(
@@ -650,6 +655,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         aux_data: AuxData = AuxData(),
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
+        mWorkTable: Optional[cute.Tensor] = None,  # LOCAL PATCH (nanochat)
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -692,7 +698,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             if const_expr(mLSE is not None):
                 mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
         # TileScheduler for varlen, simple grid for non-varlen
-        if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
+        if const_expr(self.tile_scheduler_cls is not None):
+            TileScheduler = self.tile_scheduler_cls  # LOCAL PATCH (nanochat)
+        elif const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
         else:
             TileScheduler = SingleTileScheduler
@@ -720,6 +728,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mSeqUsedQ=mSeqUsedQ,
             cu_total_m_blocks_ptr=mCuTotalMBlocks,
             cu_total_splits_m_blocks_ptr=mCuTotalSplitsMBlocks,
+            work_table=mWorkTable,  # LOCAL PATCH (nanochat)
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
@@ -814,6 +823,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 window_size_left,
                 window_size_right,
                 num_splits=self.num_splits,
+                num_n_blocks_per_split=self.n_blocks_per_split,  # LOCAL PATCH (nanochat)
                 qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             )
             seqlen = SeqlenInfoQK.create(

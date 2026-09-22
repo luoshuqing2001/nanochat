@@ -22,6 +22,7 @@ from quack import layout_utils
 
 from flash_attn_4 import utils
 
+from flash_attn_4.balanced_scheduler import BalancedCausalScheduler
 from flash_attn_4.block_info import BlockInfo
 from flash_attn_4.flash_fwd import FlashAttentionForwardBase, FlashAttentionForwardSm80
 from flash_attn_4.flash_fwd_sm120 import FlashAttentionForwardSm120
@@ -47,6 +48,7 @@ class SoftplusForwardMixin:
         window_size_left: Optional[int] = None,
         window_size_right: Optional[int] = None,
         num_splits: int = 1,
+        balanced_chunk: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -69,12 +71,23 @@ class SoftplusForwardMixin:
         # when the query-tile program count was under ~3x the SM count.
         self.num_splits = int(num_splits)
         self.is_split_kv = self.num_splits > 1
+        # Balanced scheduling: a constant `balanced_chunk` key blocks per CTA, and as many
+        # CTAs per query tile as its key range needs. Unlike num_splits this equalizes the
+        # CTAs instead of scaling them all down -- the longest CTA is `balanced_chunk`
+        # blocks whatever the query tile, and no CTA is empty, so no work is wasted.
+        # Mutually exclusive with num_splits; both use the atomic epilogue.
+        self.balanced_chunk = None if balanced_chunk is None else int(balanced_chunk)
+        if self.balanced_chunk is not None:
+            assert self.num_splits == 1, "balanced_chunk and num_splits are alternatives"
+            self.is_split_kv = True
+            self.n_blocks_per_split = self.balanced_chunk
+            self.tile_scheduler_cls = BalancedCausalScheduler
 
     def _check_type(self, mQ_type, mK_type, mV_type, mO_type, *args):
         # The split path accumulates into an fp32 O, which upstream's check rejects
         # because it insists O match Q/K/V. Check it against Q instead and defer.
         if self.is_split_kv:
-            assert mO_type is Float32, "the atomic split path needs a zeroed fp32 out"
+            assert mO_type in (Float32, mQ_type), "atomic aggregation needs fp32 or the input dtype"
             mO_type = mQ_type
         return FlashAttentionForwardBase._check_type(
             self, mQ_type, mK_type, mV_type, mO_type, *args
@@ -136,7 +149,11 @@ class SoftplusForwardMixin:
         self.apply_count_scale(acc_O, tiled_mma, tidx, m_block, seqlen)
         if const_expr(self.is_split_kv):
             # Splits accumulate into a shared fp32 O; no smem staging, no combine kernel.
-            if not self.split_is_empty(seqlen, m_block):
+            # The balanced scheduler emits no empty CTAs by construction, so it skips the
+            # guard that uniform splitting needs.
+            if const_expr(self.balanced_chunk is not None):
+                self.epilogue_atomic(acc_O, mO, seqlen, tiled_mma, tidx, m_block, head_idx, batch_idx)
+            elif not self.split_is_empty(seqlen, m_block):
                 self.epilogue_atomic(acc_O, mO, seqlen, tiled_mma, tidx, m_block, head_idx, batch_idx)
             return None
         # Not super(): zero-arg super() inside a @cute.jit method resolves back to this
@@ -200,7 +217,9 @@ class SoftplusForwardMixin:
         several splits landing on the same rows there is nothing to coalesce anyway.
         `mO` must be float32 and zeroed by the caller.
         """
-        assert mO.element_type is Float32, "the atomic split path needs a zeroed fp32 out"
+        # mO is float32 normally; with bf16 atomics it is the output dtype itself, which
+        # removes the fp32 workspace, its zeroing and the cast pass -- at the price of
+        # accumulating in bf16 across the CTAs that share a query tile.
         # Only the MMA's own threads hold accumulator fragments. The kernel launches more
         # than that, and partition_C wraps around for the rest, so without this guard every
         # element is written once per extra thread group -- silently doubling the output.
@@ -215,9 +234,10 @@ class SoftplusForwardMixin:
         for r in cutlass.range(cute.size(acc_O_mn, mode=[0]), unroll_full=True):
             if c_mn[r, 0][0] < row_limit:
                 for c in cutlass.range(cute.size(acc_O_mn, mode=[1]), unroll_full=True):
-                    cute.arch.atomic_add(
-                        ptr=utils.elem_pointer(gO_mn, (r, c)), val=acc_O_mn[r, c]
-                    )
+                    val = acc_O_mn[r, c]
+                    if const_expr(mO.element_type is not Float32):
+                        val = val.to(mO.element_type)
+                    cute.arch.atomic_add(ptr=utils.elem_pointer(gO_mn, (r, c)), val=val)
 
 
 class FlashAttentionForwardSm80Softplus(SoftplusForwardMixin, FlashAttentionForwardSm80):
