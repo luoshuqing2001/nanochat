@@ -30,7 +30,7 @@ export MUON_VARIANT="${MUON_VARIANT:-moonlight}"   # the variable under test
 source trains/_exp_common.sh                        # clears everything below this line's control
 
 export TARGET_PARAM_DATA_RATIO=51              # 12.0B tokens
-export DEVICE_BATCH_SIZE=64                         # throughput only; grad accum keeps the step fixed
+export DEVICE_BATCH_SIZE=128                        # throughput only; grad accum keeps the step fixed
 export FP8=1
 export FP8_RECIPE=tensorwise
 export SAVE_EVERY=5000
