@@ -40,6 +40,10 @@ from flash_attn_4.cute_dsl_utils import (
     validate_output_layout,
 )
 from flash_attn_4.flash_fwd import FlashAttentionForwardSm80
+from flash_attn_4.flash_fwd_softplus import (
+    FlashAttentionForwardSm80Softplus,
+    FlashAttentionForwardSm120Softplus,
+)
 from flash_attn_4.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn_4.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
 from flash_attn_4.flash_fwd_sm120 import FlashAttentionForwardSm120
@@ -48,6 +52,10 @@ from flash_attn_4.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn_4.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn_4.flash_bwd_sm100 import FlashAttentionBackwardSm100
 from flash_attn_4.flash_bwd_sm120 import FlashAttentionBackwardSm120
+from flash_attn_4.flash_bwd_softplus import (
+    FlashAttentionBackwardSm80Softplus,
+    FlashAttentionBackwardSm120Softplus,
+)
 from flash_attn_4.flash_bwd_postprocess import (
     FlashAttentionBackwardPostprocess,
     LearnableSinkBwdTensors,
@@ -578,6 +586,9 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
+    attn_kind: str = "softmax",
+    softplus_alpha: float = 1.0,
+    softplus_num_splits: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -735,7 +746,9 @@ def _flash_attn_fwd(
             out,
             "out",
             (*q_batch_seqlen_shape, num_head, head_dim_v),
-            out_torch_dtype,
+            # The softplus split path atomically accumulates into out, so it must be a
+            # zeroed fp32 buffer rather than the usual bf16 destination.
+            torch.float32 if softplus_num_splits > 1 else out_torch_dtype,
             device,
         )
         validate_output_layout(out, "out", align_bytes=16)
@@ -1215,6 +1228,12 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
         use_dedicated_hd256_kernel and cu_seqlens_q is not None and host_max_seqlen_q is None,
+        attn_kind,
+        softplus_alpha,
+        # The softplus kernel bakes the window into the epilogue's key count,
+        # unlike the softmax kernel where it is a runtime argument.
+        window_size_left if attn_kind == "softplus" else None,
+        softplus_num_splits,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -1298,7 +1317,16 @@ def _flash_attn_fwd(
         if arch // 10 == 8:
             assert page_table is None, "paged KV not supported on SM 8.0"
             assert not is_split_kv, "SplitKV not supported on SM 8.0"
-            fa_fwd = FlashAttentionForwardSm80(
+            fwd_cls, score_map_kwargs = FlashAttentionForwardSm80, {}
+            if attn_kind == "softplus":
+                fwd_cls = FlashAttentionForwardSm80Softplus
+                score_map_kwargs = dict(
+                    softplus_alpha=softplus_alpha,
+                    window_size_left=window_size_left if local else None,
+                    window_size_right=window_size_right if local else None,
+                    num_splits=softplus_num_splits,
+                )
+            fa_fwd = fwd_cls(
                 dtype,
                 head_dim,
                 head_dim_v,
@@ -1314,8 +1342,10 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
+                **score_map_kwargs,
             )
         elif arch // 10 == 9:
+            assert attn_kind == "softmax", "softplus fwd is SM80/SM120 only so far"
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
             fa_fwd = FlashAttentionForwardSm90(
                 dtype,
@@ -1340,6 +1370,7 @@ def _flash_attn_fwd(
                 paged_kv_non_tma=page_size not in [None, tile_n],
             )
         elif arch // 10 in [10, 11]:
+            assert attn_kind == "softmax", "softplus fwd is SM80/SM120 only so far"
             if qv is not None:
                 paged_kv_cpasync = page_table is not None and page_size != tile_n
                 has_qk = q is not None
@@ -1410,7 +1441,16 @@ def _flash_attn_fwd(
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
             assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
             assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
-            fa_fwd = FlashAttentionForwardSm120(
+            fwd_cls, score_map_kwargs = FlashAttentionForwardSm120, {}
+            if attn_kind == "softplus":
+                fwd_cls = FlashAttentionForwardSm120Softplus
+                score_map_kwargs = dict(
+                    softplus_alpha=softplus_alpha,
+                    window_size_left=window_size_left if local else None,
+                    window_size_right=window_size_right if local else None,
+                    num_splits=softplus_num_splits,
+                )
+            fa_fwd = fwd_cls(
                 dtype,
                 head_dim,
                 head_dim_v,
@@ -1426,6 +1466,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
+                **score_map_kwargs,
             )
         else:
             raise ValueError(
@@ -1880,6 +1921,22 @@ def _bwd_postprocess_convert(
 _bwd_postprocess_convert.compile_cache = get_jit_cache("bwd_post")
 
 
+def _softplus_row_scale(seqlen_q, seqlen_k, seqlen_q_rounded, causal, window_left, alpha, device):
+    """n_i^-alpha per query row, padded to seqlen_q_rounded.
+
+    Rides to the backward kernel inside the LSE and dPsum buffers, which softplus has no
+    other use for. Padding rows are never read, but are kept finite anyway.
+    """
+    i = torch.arange(seqlen_q_rounded, device=device, dtype=torch.float32)
+    if causal:
+        n = (i + (seqlen_k - seqlen_q + 1)).clamp(max=float(seqlen_k))
+        if window_left is not None:
+            n = n.clamp(max=float(window_left + 1))
+    else:
+        n = torch.full_like(i, float(seqlen_k))
+    return n.clamp(min=1.0).pow(-float(alpha))
+
+
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1921,6 +1978,8 @@ def _flash_attn_bwd(
     aux_tensors: Optional[list[torch.Tensor]] = None,
     aux_scalars: Optional[tuple] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    attn_kind: str = "softmax",
+    softplus_alpha: float = 1.0,
     dlse: Optional[torch.Tensor] = None,
     learnable_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, ...]:
@@ -2323,14 +2382,29 @@ def _flash_attn_bwd(
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
     # For hd=256 dedicated path, dq_accum is None so preprocess only fills dpsum/lse_log2.
-    _bwd_preprocess(
-        out, dout, dpsum, lse, lse_log2, dq_accum,
-        cu_seqlens_q, seqused_q, dlse,
-        dtype, head_dim, head_dim_v, m_block_size,
-        cu_total_m_blocks=cu_total_m_blocks_q,
-        fake_mode=fake_mode,
-        hdim_multiple_of=hdim_multiple_of,
-    )
+    if attn_kind == "softplus":
+        # Softplus needs neither the LSE nor rowsum(dO*O), so the whole preprocess pass
+        # over O and dO is skipped; only dq_accum still has to be zeroed. The two row
+        # buffers instead carry n^-alpha to the kernel (see flash_bwd_softplus.py).
+        assert not is_varlen, "softplus backward does not support varlen yet"
+        if not fake_mode:
+            if dq_accum is not None:
+                dq_accum.zero_()
+            row_scale = _softplus_row_scale(
+                seqlen_q, seqlen_k, seqlen_q_rounded, causal or local,
+                window_size_left if local else None, softplus_alpha, device,
+            )
+            lse_log2.copy_(row_scale.expand_as(lse_log2))
+            dpsum.copy_(lse_log2)
+    else:
+        _bwd_preprocess(
+            out, dout, dpsum, lse, lse_log2, dq_accum,
+            cu_seqlens_q, seqused_q, dlse,
+            dtype, head_dim, head_dim_v, m_block_size,
+            cu_total_m_blocks=cu_total_m_blocks_q,
+            fake_mode=fake_mode,
+            hdim_multiple_of=hdim_multiple_of,
+        )
     # num_threads: SM90 derives from BwdConfig.num_wg, SM120 is set to 128 above,
     # SM100/SM110 uses default from function signature (384).
     if arch // 10 not in [9, 12]:
@@ -2431,6 +2505,7 @@ def _flash_attn_bwd(
             single_q_block,
             single_k_block,
             cu_total_m_blocks_k is not None,
+            attn_kind,
         )
     else:
         compile_key = (
@@ -2474,6 +2549,7 @@ def _flash_attn_bwd(
             cu_total_m_blocks_k is not None,
             use_dedicated_hd256_kernel and cu_seqlens_q is not None and max_seqlen_q is None,
             use_dedicated_hd256_kernel and cu_seqlens_k is not None and max_seqlen_k is None,
+            attn_kind,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -2502,7 +2578,13 @@ def _flash_attn_bwd(
             for t in (dQ_semaphore, dK_semaphore, dV_semaphore)
         ]
         if arch // 10 in [8, 12]:
-            flash_bwd_obj_cls = FlashAttentionBackwardSm120 if arch // 10 == 12 else FlashAttentionBackwardSm80
+            if attn_kind == "softplus":
+                flash_bwd_obj_cls = (
+                    FlashAttentionBackwardSm120Softplus if arch // 10 == 12
+                    else FlashAttentionBackwardSm80Softplus
+                )
+            else:
+                flash_bwd_obj_cls = FlashAttentionBackwardSm120 if arch // 10 == 12 else FlashAttentionBackwardSm80
             fa_bwd_obj = flash_bwd_obj_cls(
                 dtype,
                 head_dim,
@@ -2527,6 +2609,7 @@ def _flash_attn_bwd(
                 score_mod_bwd=score_mod_bwd,
             )
         elif arch // 10 == 9:
+            assert attn_kind == "softmax", "softplus bwd is SM80/SM120 only so far"
             fa_bwd_obj = FlashAttentionBackwardSm90(
                 dtype,
                 head_dim,

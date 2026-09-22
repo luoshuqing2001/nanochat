@@ -878,6 +878,27 @@ class FlashAttentionBackwardSm80:
                 tidx, n_block, head_idx, batch_idx, seqlen, d_head, d_head_v
             )
 
+    # LOCAL PATCH (nanochat): the two score-map-dependent steps of the backward, as
+    # methods rather than inline loops. Softmax needs the LSE to recompute P and the
+    # dO.O row sums to form dS; softplus needs neither, so a subclass overrides these
+    # two and the rest of the backward is untouched. See flash_bwd_softplus.py.
+    @cute.jit
+    def bwd_recompute_p(
+        self, acc_S_mn, acc_S_pre_mn, tLSErLSE, softmax_scale, softmax_scale_log2
+    ) -> None:
+        """Recompute P from the scores, in place in acc_S_mn."""
+        for r in cutlass.range(cute.size(acc_S_mn, mode=[0]), unroll_full=True):
+            acc_S_mn[r, None].store(
+                cute.math.exp2(
+                    acc_S_mn[r, None].load() * softmax_scale_log2 - tLSErLSE[r], fastmath=True
+                )
+            )
+
+    @cute.jit
+    def bwd_grad_val(self, acc_S_mn, acc_dP_mn, acc_S_pre_mn, tLSErdPsum, r):
+        """dS for one row: P * (dP - rowsum(dO.O)) for softmax."""
+        return acc_S_mn[r, None].load() * (acc_dP_mn[r, None].load() - tLSErdPsum[r])
+
     @cute.jit
     def compute_one_m_block(
         self,
@@ -951,8 +972,9 @@ class FlashAttentionBackwardSm80:
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_S_mn)
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == 1: cute.print_tensor(tLSErLSE)
         assert cute.size(acc_S_mn, mode=[0]) == cute.size(tLSErLSE)
-        for r in cutlass.range(cute.size(acc_S_mn, mode=[0]), unroll_full=True):
-            acc_S_mn[r, None].store(cute.math.exp2(acc_S_mn[r, None].load() * softmax_scale_log2 - tLSErLSE[r], fastmath=True))
+        # LOCAL PATCH (nanochat): factored out so a subclass can swap the score map
+        # (see flash_bwd_softplus.py). Identical code, one call deeper.
+        self.bwd_recompute_p(acc_S_mn, acc_S_pre_mn, tLSErLSE, softmax_scale, softmax_scale_log2)
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_S_mn)
 
         # MMA dP
@@ -976,7 +998,8 @@ class FlashAttentionBackwardSm80:
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
         assert cute.size(acc_dP_mn, mode=[0]) == cute.size(tLSErdPsum)
         for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
-            grad_val = acc_S_mn[r, None].load() * (acc_dP_mn[r, None].load() - tLSErdPsum[r])
+            # LOCAL PATCH (nanochat): likewise.
+            grad_val = self.bwd_grad_val(acc_S_mn, acc_dP_mn, acc_S_pre_mn, tLSErdPsum, r)
             if cutlass.const_expr(self.score_mod_bwd is not None):
                 grad_val = call_score_mod_bwd(
                     self.score_mod_bwd,

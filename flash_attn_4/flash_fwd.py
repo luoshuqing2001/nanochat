@@ -38,6 +38,16 @@ from flash_attn_4.utils import AuxData
 
 
 class FlashAttentionForwardBase:
+    # LOCAL PATCH (nanochat): the score map is a class attribute so a subclass can
+    # swap softmax for another one (see flash_fwd_softplus.py) without copying kernel().
+    score_map_cls = Softmax
+    # LOCAL PATCH (nanochat): split-KV knobs, likewise class attributes. Upstream's
+    # SM80/SM120 forward is single-split; softplus can split the key range because it
+    # never normalizes, so partial outputs just add up (see flash_fwd_softplus.py).
+    # Left at these defaults the const_expr folds the split path away entirely.
+    is_split_kv = False
+    num_splits = 1
+
 
     def __init__(
         self,
@@ -695,7 +705,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             num_block=cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),
             num_head=cute.size(mQ.shape[2]),
             num_batch=num_batch,
-            num_splits=1,
+            # LOCAL PATCH (nanochat): was hardcoded 1; see the split-KV knobs above.
+            num_splits=self.num_splits,
+            is_split_kv=self.is_split_kv,
             seqlen_k=0,
             headdim=mQ.shape[1],
             headdim_v=mV.shape[1],
@@ -791,16 +803,17 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         work_tile = tile_scheduler.initial_work_tile_info()
 
         if work_tile.is_valid_tile:
-            m_block, num_head, batch_size, _ = work_tile.tile_idx
+            m_block, num_head, batch_size, split_idx = work_tile.tile_idx
 
             block_info = BlockInfo(
                 self.tile_m,
                 self.tile_n,
                 self.is_causal,
                 self.is_local,
-                False,  # is_split_kv
+                self.is_split_kv,  # LOCAL PATCH (nanochat): was hardcoded False
                 window_size_left,
                 window_size_right,
+                num_splits=self.num_splits,
                 qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             )
             seqlen = SeqlenInfoQK.create(
@@ -812,7 +825,11 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 mSeqUsedQ=mSeqUsedQ,
                 mSeqUsedK=mSeqUsedK,
             )
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            # LOCAL PATCH (nanochat): split_idx/num_splits threaded through; both are
+            # the neutral 0/1 unless a subclass turns is_split_kv on.
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, m_block, split_idx, self.num_splits
+            )
             # For varlen, wasted grid tiles (where batch_idx >= num_batch) will have
             # seqlen_q=seqlen_k=0 and n_block_max=0.  Clamp to 0 so we don't use a
             # negative block index for K/V loads; the load/store predicates already
@@ -915,7 +932,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 tVpV = utils.predicate_k(tVcV, limit=mV.shape[1])
 
             # shape: (atom_v_m * rest_m)
-            softmax = Softmax.create(
+            softmax = self.score_map_cls.create(
                 softmax_scale_log2,
                 num_rows=acc_O.shape[0][0] * acc_O.shape[1],
                 softmax_scale=softmax_scale,
@@ -1059,11 +1076,12 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                     smem_pipe_write = self.advance_pipeline(smem_pipe_write)
             # The remaining iterations have no masking
-            # LOCAL PATCH (nanochat): stop at n_block_min instead of 0. This is the
-            # "TODO: local" below: for sliding-window attention the blocks under the
-            # window were being computed and then thrown away by the mask, so a windowed
-            # forward cost exactly as much as a full-causal one. Identical to upstream
-            # whenever n_block_min is 0, which is every non-local case.
+            # LOCAL PATCH (nanochat): stop at n_block_min instead of 0. Identical to
+            # upstream whenever n_block_min is 0, which is every non-split causal case.
+            # A split owns [n_block_min, n_block_max) and the blocks below it belong to
+            # another split -- unmasked, so running into them double-counts. (This is
+            # also the "TODO: local" below: for SWA the blocks under the window were
+            # being computed and then thrown away by the mask.)
             for n_tile in cutlass.range(n_block - n_block_min, unroll=1):
                 compute_one_n_block(
                     n_block - n_tile - 1, smem_pipe_read, smem_pipe_write,
