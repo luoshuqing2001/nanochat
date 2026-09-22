@@ -99,6 +99,40 @@ WARMUP_STEPS, WARMDOWN_RATIO, NUM_ITERATIONS, TARGET_PARAM_DATA_RATIO, EVAL_EVER
 EVAL_TOKENS, SAMPLE_EVERY, SAVE_EVERY, CORE_METRIC_EVERY, FINAL_EVAL, WANDB_RUN,
 NPROC_PER_NODE, PYTHON_BIN, NANOCHAT_BASE_DIR`.
 
+### Getting only the data you need
+
+```bash
+python trains/fetch_data.py --depth 24 --dry-run   # what it would fetch, and why
+python trains/fetch_data.py --depth 24             # fetch exactly that
+```
+
+It sizes the download from the model rather than from a raw shard count:
+`tokens = 12 x scaling_params(depth)`, times a 1.25 margin, divided by **44.8M tokens
+per shard**. That constant is measured, not assumed -- the finished d12 run consumed
+2,520 x 524,288 = 1.321B tokens and stopped at parquet 29, row group 43 of 84, i.e.
+29.51 shards. A shard is ~88 MB, so roughly 521M tokens per GB.
+
+| target | tokens | shards | disk |
+|---|---|---|---|
+| d12 | 1.3B | 37 | 3 GB |
+| d16 | 2.8B | 79 | 7 GB |
+| d20 | 5.2B | 146 | 13 GB |
+| d22 (~1.1B params) | 6.8B | 191 | 16 GB |
+| d24 (~1.4B params) | 8.8B | 245 | 21 GB |
+| d32 | 20.1B | 562 | 48 GB |
+
+**Do not use `python -m nanochat.dataset -n N` to top up.** Besides sizing by raw
+shard count, it always also downloads `shard_06542` (upstream's `MAX_SHARD`), which
+then sorts last and silently becomes the validation set. nanochat validates on the
+highest-numbered shard it finds (`dataset.py`: train is `paths[:-1]`, val is
+`paths[-1:]`), so that one extra file invalidates every earlier bpb comparison.
+`fetch_data.py` pins the validation shard instead (`--val-shard`, default 2499, which
+is what the runs in `logs/` used) and refuses a budget that would run past it.
+
+`--prune --yes` deletes shards outside the keep set; it never deletes the validation
+shard, and without `--yes` it only reports. ClimbMix ships pre-shuffled
+("climbmix-400b-shuffle"), so keeping a contiguous prefix is an unbiased sample.
+
 ### Muon variants
 
 `MUON_VARIANT` picks the update rule for the matrix parameters:
