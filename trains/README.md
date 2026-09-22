@@ -227,15 +227,26 @@ experiment to run.
 
 ### The experiment series
 
-One file per point in the series, each pinning the knobs so the arms cannot drift:
+One file per point in the series. They are hermetic: `_exp_common.sh` clears every
+knob the engine reads before the file sets its own, so nothing left in a shell can
+retarget a run. Only `MUON_VARIANT` (which arm), `RESUME`, `DRY_RUN`, `SMOKE` and the
+machine paths get through, and each run prints what it resolved to before starting.
 
 ```bash
-bash trains/exp_d12_ctrl.sh      # control
-bash trains/exp_d16_ctrl.sh      # control
-bash trains/exp_d20_60b.sh       # the headline run
-MUON_VARIANT=nanochat bash trains/exp_d20_60b.sh   # its baseline arm
+bash trains/exp_d12_ctrl.sh                        # ablation, moonlight arm
+MUON_VARIANT=nanochat bash trains/exp_d12_ctrl.sh  # ablation, baseline arm
+bash trains/exp_d16_ctrl.sh
+bash trains/exp_d20_60b.sh                         # headline
 RESUME=<run_id> bash trains/exp_d20_60b.sh         # after a container restart
 ```
+
+```
+experiment: d12 | arm 'moonlight' | 12.0B tokens (ratio 109) | bs 64 | FP8 1
+```
+
+To change an experiment, edit its file: the change then lands in git next to the
+results. Use the size wrappers (`train_dNN_hybrid_swa_muon.sh`) for throughput
+experiments and smoke tests, where overriding from the environment is the point.
 
 The ablation tier and the headline run use **different** budgets, which is what the
 architecture literature does: a cheap fixed config for sweeping variants, a larger one
