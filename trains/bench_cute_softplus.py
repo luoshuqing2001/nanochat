@@ -40,6 +40,34 @@ def bench_shape(B, T, H, D, W, splits_list):
     return rows
 
 
+def bench_inference_vs_softmax():
+    """The comparison that matters for serving: softplus against softmax, same shapes.
+
+    Softmax cannot use the balanced schedule -- its partial outputs need a combine pass
+    keyed on each part's LSE -- so this is the one place where dropping the
+    normalisation buys real speed rather than a fraction of a percent.
+    """
+    print("\n=== inference: CuTe softplus vs FA4 softmax (fwd only) ===")
+    print(f"  {'shape':<26}{'FA4 softmax':>13}{'CuTe softplus':>15}{'speedup':>10}   chunk")
+    for tag, B, Tq, Tk, H, D in [
+        ("prefill H1  T4096",   1, 4096, 4096,  1, 128),
+        ("prefill H1  T8192",   1, 8192, 8192,  1, 128),
+        ("prefill H12 T8192",   1, 8192, 8192, 12, 128),
+        ("decode  H6  Tk4096",  1, 1, 4096,   6, 128),
+        ("decode  H6  Tk16384", 1, 1, 16384,  6, 128),
+        ("decode  H6  Tk65536", 1, 1, 65536,  6, 128),
+        ("decode  H12 Tk65536", 1, 1, 65536, 12, 128),
+        ("decode  H6  Tk131072",1, 1, 131072, 6, 128),
+    ]:
+        q = torch.randn(B, Tq, H, D, device="cuda", dtype=torch.bfloat16)
+        k, v = (torch.randn(B, Tk, H, D, device="cuda", dtype=torch.bfloat16) for _ in range(2))
+        sc = 1.0 / math.sqrt(D)
+        smx = timeit(lambda: _flash_attn_fwd(q, k, v, softmax_scale=sc, causal=True))
+        spl = timeit(lambda: softplus_attn_fa4(q, k, v, True, (None, 0), 1.0, sc, num_splits="auto"))
+        print(f"  {tag:<26}{smx:10.3f} ms{spl:12.3f} ms{smx/spl:9.2f}x   "
+              f"{auto_balanced_chunk(B, H, Tq, Tk)}")
+
+
 def bench_inference(splits_list):
     """Where tile splitting actually pays: one sequence, long context."""
     print("\n=== long-context inference, single sequence (fwd only) ===")
@@ -84,3 +112,4 @@ if __name__ == "__main__":
         for name, ms in rows.items():
             print(f"  {name:<22} {ms:7.3f} ms   {base / ms:5.2f}x vs triton softplus")
     bench_inference(args.splits)
+    bench_inference_vs_softmax()
