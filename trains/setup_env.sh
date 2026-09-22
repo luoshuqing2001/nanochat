@@ -93,8 +93,16 @@ BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 DATA_DIR="${NANOCHAT_DATA_DIR:-$REPO_DIR/base_data_climbmix}"
 if [ -f "$BASE_DIR/tokenizer/tokenizer.pkl" ] && [ -f "$BASE_DIR/tokenizer/token_bytes.pt" ]; then
     good "tokenizer" "$BASE_DIR/tokenizer"
+elif [ -f "$REPO_DIR/trains/tokenizer/tokenizer.pkl" ]; then
+    if [ "$INSTALL" = "1" ]; then
+        mkdir -p "$BASE_DIR/tokenizer"
+        cp "$REPO_DIR/trains/tokenizer/tokenizer.pkl" "$REPO_DIR/trains/tokenizer/token_bytes.pt" "$BASE_DIR/tokenizer/"
+        good "tokenizer" "installed from trains/tokenizer -> $BASE_DIR/tokenizer"
+    else
+        soft "tokenizer" "not in $BASE_DIR/tokenizer, but trains/tokenizer has it -- re-run with INSTALL=1, or: cp trains/tokenizer/* \"$BASE_DIR/tokenizer/\""
+    fi
 else
-    fail "tokenizer" "missing in $BASE_DIR/tokenizer -- copy it from another box (2 files, <1 MB) or run: python -m scripts.tok_train"
+    fail "tokenizer" "missing in $BASE_DIR/tokenizer and in trains/tokenizer -- run: python -m scripts.tok_train (note: a re-trained tokenizer is not the same one, see trains/tokenizer/README.md)"
 fi
 shards=$(ls "$DATA_DIR"/*.parquet 2>/dev/null | wc -l)
 if [ "$shards" -gt 1 ]; then

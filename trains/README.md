@@ -294,11 +294,14 @@ and data shards, and which attention backend resolves. It deliberately does **no
 install torch -- pick the wheel for your CUDA first, e.g.
 `pip install --index-url https://download.pytorch.org/whl/cu130 torch`.
 
-Two assets do not come from git: the tokenizer (`$NANOCHAT_BASE_DIR/tokenizer`, two
-files under 1 MB -- copy it to reproduce runs exactly, or retrain with
-`python -m scripts.tok_train`) and the ClimbMix shards (copy them, or
-`python -m nanochat.dataset -n 200`, then point `NANOCHAT_DATA_DIR` at them). The FA4
-kernels *do* come from git, because they are vendored in `flash_attn_4/`.
+The tokenizer now comes from git too: `trains/tokenizer/` holds the 545 KB it takes,
+and `INSTALL=1 bash trains/setup_env.sh` copies it into `$NANOCHAT_BASE_DIR/tokenizer`.
+Re-training it instead produces a *different* tokenizer, which silently makes bpb
+numbers incomparable with the runs in `logs/` -- see `trains/tokenizer/README.md`.
+
+Only the ClimbMix shards stay outside git: fetch them with
+`python trains/fetch_data.py` (see "Getting only the data you need"). The FA4 kernels
+are vendored in `flash_attn_4/`, so they come from git as well.
 
 What changes on Blackwell datacenter parts (B200 sm100, B300 sm103):
 
