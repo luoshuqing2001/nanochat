@@ -58,13 +58,22 @@ def sweep(base, short, T, D):
     strides = (q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2),
                v.stride(0), v.stride(1), v.stride(2))
 
+    combos = [(bm, bn, w, st) for bm in (64, 128, 256) for bn in (64, 128)
+              for w in (4, 8, 16) for st in (2, 3, 4)]
+    print(f"sweeping {len(combos)} configurations x 2 windows x 2 phases. Each one compiles "
+          f"before it runs, so expect minutes, and run with python -u or no pipe: a pipe "
+          f"buffers this output until the end.", flush=True)
+
     for label, win in ((f"S ({short})", short), ("L (full)", -1)):
         for phase in ("forward", "backward"):
             rows = []
-            for bm in (64, 128, 256):
-                for bn in (64, 128):
-                    for warps in (4, 8, 16):
-                        for stages in (2, 3, 4):
+            print(f"\n{label} {phase}:", end="", flush=True)
+            for n_done, (bm, bn, warps, stages) in enumerate(combos):
+                if True:
+                    if True:
+                        if True:
+                            print(f"\r{label} {phase}: {n_done + 1}/{len(combos)} "
+                                  f"({bm}x{bn} w{warps} s{stages})    ", end="", flush=True)
                             cfg = dict(WINDOW=win, HEAD_DIM=D, BLOCK_M=bm, BLOCK_N=bn,
                                        num_warps=warps, num_stages=stages)
                             try:
@@ -85,9 +94,11 @@ def sweep(base, short, T, D):
                             except Exception:
                                 pass
             rows.sort()
-            print(f"\n{label} {phase}: top 5 of {len(rows)} configurations that compiled")
+            print(f"\r{label} {phase}: top 5 of {len(rows)}/{len(combos)} that compiled" + " " * 20,
+                  flush=True)
             for t, bm, bn, w, st in rows[:5]:
-                print(f"  {t:7.2f}ms  BLOCK_M={bm:<4} BLOCK_N={bn:<4} num_warps={w:<3} num_stages={st}")
+                print(f"  {t:7.2f}ms  BLOCK_M={bm:<4} BLOCK_N={bn:<4} num_warps={w:<3} "
+                      f"num_stages={st}", flush=True)
 
 
 def main():
