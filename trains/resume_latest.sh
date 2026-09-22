@@ -49,12 +49,20 @@ echo "run:        $RUN_ID"
 echo "checkpoints: ${STEPS[*]}"
 echo "resuming at: step $LAST  ($(du -sh "$CKPT_DIR" | cut -f1) on disk)"
 
-# The optimizer shard must exist too, or base_train cannot restore the optimizer.
-[ -f "$CKPT_DIR/optim_$(printf '%06d' "$LAST")_rank0.pt" ] || {
-    echo "ERROR: step $LAST has no optimizer shard; the run was killed mid-save. "\
-         "Delete that step's files and re-run to fall back to the previous checkpoint." >&2
+# Every rank's optimizer shard must be there. A container killed mid-save leaves a
+# step with only some of them, and each rank loads its own, so a partial set means a
+# crash on resume rather than a clean fallback.
+shards_for() { ls "$CKPT_DIR"/optim_$(printf '%06d' "$1")_rank*.pt 2>/dev/null | wc -l; }
+EXPECTED=0
+for s in "${STEPS[@]}"; do n=$(shards_for "$s"); [ "$n" -gt "$EXPECTED" ] && EXPECTED=$n; done
+HAVE=$(shards_for "$LAST")
+if [ "$HAVE" -lt "$EXPECTED" ]; then
+    echo "ERROR: step $LAST has $HAVE optimizer shards but other checkpoints have $EXPECTED;" >&2
+    echo "the run was killed mid-save. Remove that step and re-run to fall back:" >&2
+    echo "  rm -f $CKPT_DIR/*_$(printf '%06d' "$LAST")*" >&2
     exit 1
-}
+fi
+echo "optimizer:   $HAVE shard(s) present"
 
 if [ "$KEEP" -gt 0 ] && [ "${#STEPS[@]}" -gt "$KEEP" ]; then
     DROP=$(( ${#STEPS[@]} - KEEP ))
