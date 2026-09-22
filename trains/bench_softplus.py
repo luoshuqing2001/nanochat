@@ -43,12 +43,62 @@ def tm(fn, iters=20, warmup=8, reps=3):
     return sorted(once() for _ in range(reps))[reps // 2]
 
 
+def sweep(base, short, T, D):
+    """Search BLOCK_M/BLOCK_N/warps/stages for forward and backward, per window regime.
+
+    The defaults in _fwd_config were swept on a GB10: 48 SMs, 228 KB of shared memory per
+    SM, ~206 GB/s. A B200 has 148 SMs and far more shared memory and bandwidth, so larger
+    tiles and deeper pipelining should win there and the GB10 choice is probably wrong.
+    Paste the winners back into _fwd_config and _bwd."""
+    import triton
+    q, k, v = base
+    B, _, H, _ = q.shape
+    do = torch.randn_like(q)
+    dq, dk, dv = (torch.empty_like(x) for x in (q, k, v))
+    strides = (q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2),
+               v.stride(0), v.stride(1), v.stride(2))
+
+    for label, win in ((f"S ({short})", short), ("L (full)", -1)):
+        for phase in ("forward", "backward"):
+            rows = []
+            for bm in (64, 128, 256):
+                for bn in (64, 128):
+                    for warps in (4, 8, 16):
+                        for stages in (2, 3, 4):
+                            cfg = dict(WINDOW=win, HEAD_DIM=D, BLOCK_M=bm, BLOCK_N=bn,
+                                       num_warps=warps, num_stages=stages)
+                            try:
+                                if phase == "forward":
+                                    o = torch.empty_like(q)
+                                    fn = lambda: SA._fwd_kernel[(triton.cdiv(T, bm), B, H)](
+                                        q, k, v, o, *strides, o.stride(0), o.stride(1), o.stride(2),
+                                        T, D ** -0.5, 1.0, REVERSE=False, **cfg)
+                                else:
+                                    a = (*strides, do.stride(0), do.stride(1), do.stride(2),
+                                         T, D ** -0.5, 1.0)
+                                    def fn():
+                                        SA._bwd_kv_kernel[(triton.cdiv(T, bn), B, H)](
+                                            q, k, v, do, dk, dv, *a, REVERSE=False, **cfg)
+                                        SA._bwd_q_kernel[(triton.cdiv(T, bm), B, H)](
+                                            q, k, v, do, dq, *a, REVERSE=False, **cfg)
+                                rows.append((tm(fn, 10, 4, 1), bm, bn, warps, stages))
+                            except Exception:
+                                pass
+            rows.sort()
+            print(f"\n{label} {phase}: top 5 of {len(rows)} configurations that compiled")
+            for t, bm, bn, w, st in rows[:5]:
+                print(f"  {t:7.2f}ms  BLOCK_M={bm:<4} BLOCK_N={bn:<4} num_warps={w:<3} num_stages={st}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--depth", type=int, default=20)
     ap.add_argument("--batch", type=int, default=64, help="micro-batch, i.e. DEVICE_BATCH_SIZE")
     ap.add_argument("--seq-len", type=int, default=2048)
     ap.add_argument("--head-dim", type=int, default=128)
+    ap.add_argument("--sweep", action="store_true",
+                    help="search launch configurations on this machine instead of benchmarking; "
+                         "the shipped defaults were swept on a GB10 and do not transfer")
     args = ap.parse_args()
 
     assert torch.cuda.is_available()
@@ -63,6 +113,11 @@ def main():
     print(f"achieved bandwidth ~{bw:.0f} GB/s (GB10 measured ~206)\n")
 
     base = [torch.randn(B, T, H, D, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+
+    if args.sweep:
+        sweep(base, short, T, D)
+        return
+
     try:
         import flash_attn_4.fa3_compat as fa4
         have_fa4 = fa4.has_custom_op()
