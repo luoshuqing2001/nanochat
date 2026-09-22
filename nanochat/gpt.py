@@ -165,6 +165,8 @@ class GPT(nn.Module):
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
+        # Tokens per chunk in the loss head; 0 disables chunking. See loss_from_hidden().
+        self.loss_chunk_tokens = 0
         # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward().
         # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
@@ -513,21 +515,50 @@ class GPT(nn.Module):
             x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
 
-        # Forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
-
-        if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
-        else:
+        if targets is None:
             # inference: just return the logits directly
-            return logits
+            return self.compute_logits(x)
+
+        # training: the loss head is the memory peak of the whole model. At B*T = 131,072
+        # and vocab 32,768 the fp32 logits alone are 17.2 GiB, and softcap + cross entropy
+        # need several more buffers of that size. Chunking over tokens and recomputing each
+        # chunk in the backward pass (loss_chunk_tokens > 0) trades one extra lm_head matmul
+        # -- a few percent of model FLOPs -- for a proportional cut in that peak.
+        x_flat = x.view(-1, x.size(-1))
+        targets_flat = targets.view(-1)
+        chunk = self.loss_chunk_tokens
+        if chunk <= 0 or chunk >= x_flat.size(0) or not torch.is_grad_enabled():
+            return self.loss_from_hidden(x_flat, targets_flat, loss_reduction)
+
+        from torch.utils.checkpoint import checkpoint
+        if loss_reduction == 'none':
+            parts = [checkpoint(self.loss_from_hidden, x_flat[i:i + chunk], targets_flat[i:i + chunk],
+                                'none', use_reentrant=False)
+                     for i in range(0, x_flat.size(0), chunk)]
+            return torch.cat(parts)
+        # 'mean' and 'sum' both accumulate a sum; 'mean' divides once at the end by the
+        # global count of non-ignored targets, which is what an unchunked mean does.
+        total = None
+        for i in range(0, x_flat.size(0), chunk):
+            part = checkpoint(self.loss_from_hidden, x_flat[i:i + chunk], targets_flat[i:i + chunk],
+                              'sum', use_reentrant=False)
+            total = part if total is None else total + part
+        if loss_reduction == 'sum':
+            return total
+        return total / (targets_flat != -1).sum().clamp(min=1)
+
+    def compute_logits(self, x):
+        """lm_head + logit softcap. Returns fp32 logits of shape (..., vocab_size)."""
+        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
+        logits = self.lm_head(x) # (..., padded_vocab_size) <- very big tensor
+        logits = logits[..., :self.config.vocab_size] # slice to remove padding
+        logits = logits.float() # fp32 for the softcap and the loss
+        return softcap * torch.tanh(logits / softcap)
+
+    def loss_from_hidden(self, x_flat, targets_flat, reduction):
+        """Cross entropy over one slice of flattened tokens, logits never leaving this call."""
+        logits = self.compute_logits(x_flat)
+        return F.cross_entropy(logits, targets_flat, ignore_index=-1, reduction=reduction)
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

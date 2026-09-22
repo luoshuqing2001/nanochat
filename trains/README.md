@@ -225,6 +225,28 @@ LR above 0.01. No quality claim is made either way: the short runs used for cali
 are all inside the LR warmup and say nothing about final loss. That comparison is the
 experiment to run.
 
+### Chunked loss head
+
+`LOSS_CHUNK_TOKENS=N` splits the lm_head + logit-softcap + cross-entropy over N tokens
+at a time and recomputes each chunk in the backward pass. **Default 0 (off), and worth
+leaving off at the shapes here.**
+
+Measured on one GB10, d20, bs 32 (B*T = 65,536), FA4, compiled:
+
+| | peak memory | throughput |
+|---|---|---|
+| off | 69.39 GiB | 13,946 tok/s |
+| 8192 | 68.09 GiB | 13,850 tok/s |
+
+1.9% of the memory for 0.7% of the speed -- not the trade the source code suggests.
+Reading `gpt.py`, the fp32 logits are `B*T x vocab x 4` bytes (8.6 GiB at this shape,
+17.2 GiB at bs 64) and look like the dominant allocation, but inductor already handles
+that chain well, and the peak is set by the saved activations of the 20 blocks instead.
+The knob is kept because it becomes real at larger `B*T` or a larger vocabulary, and
+because it is exact: loss matches to 4e-6, and gradients differ by less than one bf16
+ulp -- two different chunk sizes differ from each other by as much as either differs
+from unchunked.
+
 ### Where the time goes
 
 ```bash

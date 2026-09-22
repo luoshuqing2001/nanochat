@@ -446,6 +446,12 @@ TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:-524288}"   # tokens per optimizer step (-1
 # FP8 for the linear layers (nanochat/fp8.py, torch._scaled_mm). Needs FP8 tensor
 # cores to pay off: worthwhile on sm_100 (B200/B300), pointless on GB10. Both arms of
 # a comparison must agree on this, or the comparison measures FP8 too.
+# Chunk the lm_head + cross-entropy over tokens and recompute each chunk in backward.
+# The fp32 logits are the model's biggest allocation (B*T x vocab x 4 bytes: 17.2 GiB at
+# B*T=131,072 and vocab 32,768), so this is the cheapest way to buy memory back. Costs
+# one extra lm_head matmul, a few percent of model FLOPs. 0 disables.
+LOSS_CHUNK_TOKENS="${LOSS_CHUNK_TOKENS:-0}"
+
 FP8="${FP8:-0}"
 FP8_RECIPE="${FP8_RECIPE:-tensorwise}"   # tensorwise (faster) | rowwise (more accurate)
 
@@ -574,6 +580,7 @@ cat > "$RUN_DIR/config.json" <<JSON
   "aspect_ratio": $ASPECT_RATIO,
   "optimizer": "MuonAdamW (Muon on matrices, AdamW on embeddings/scalars)",
   "muon_variant": "$MUON_VARIANT",
+  "loss_chunk_tokens": $LOSS_CHUNK_TOKENS,
   "fp8": $([ "$FP8" = "1" ] && echo true || echo false),
   "fp8_recipe": "$FP8_RECIPE",
   "device_batch_size": $DEVICE_BATCH_SIZE,
@@ -612,6 +619,7 @@ TRAIN_ARGS=(
     --head-dim="$HEAD_DIM"
     --max-seq-len="$MAX_SEQ_LEN"
     --window-pattern="$WINDOW_PATTERN"
+    --loss-chunk-tokens="$LOSS_CHUNK_TOKENS"
     --device-batch-size="$DEVICE_BATCH_SIZE"
     --total-batch-size="$TOTAL_BATCH_SIZE"
     --matrix-lr="$MATRIX_LR"
