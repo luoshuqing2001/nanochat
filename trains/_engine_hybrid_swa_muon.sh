@@ -271,6 +271,7 @@ write_run_header() {
     NUM_ITERATIONS="$NUM_ITERATIONS" TARGET_PARAM_DATA_RATIO="$TARGET_PARAM_DATA_RATIO" \
     NPROC_PER_NODE="$NPROC_PER_NODE" NUM_SHARDS="$NUM_SHARDS" \
     DIAGNOSTICS_EVERY="$DIAGNOSTICS_EVERY" MUON_VARIANT="$MUON_VARIANT" \
+    FP8="$FP8" FP8_RECIPE="$FP8_RECIPE" \
     GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
     GIT_DIRTY="$(git status --porcelain 2>/dev/null | wc -l)" \
     "$PYTHON_BIN" - <<'RUN_HEADER_PY'
@@ -320,6 +321,11 @@ try:
     line("", f"HAS_FA3={fa.HAS_FA3} HAS_FA4={fa.HAS_FA4} "
              f"NANOCHAT_ATTN={os.environ.get('NANOCHAT_ATTN', 'auto')}")
     line("", f"compute dtype {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
+    if os.environ.get("FP8") == "1":
+        line("", f"FP8 linear layers ON ({os.environ.get('FP8_RECIPE')} scaling) -- matmuls run in "
+                 "float8_e4m3 forward / e5m2 grads via torch._scaled_mm; attention stays bf16")
+    else:
+        line("", "FP8 off (set FP8=1 for float8 linear layers; needs sm_100+ to pay off)")
     line("", "inference / KV-cache path always uses SDPA (FA4 has no kvcache entry point)")
 
     # model + per-layer windows, built on meta so this costs no memory
@@ -437,6 +443,12 @@ TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:-524288}"   # tokens per optimizer step (-1
 # Muon update rule: 'nanochat' (MuonEq + Muon+ + NorMuon + cautious decay) or
 # 'moonlight' (RMS-matched update + decoupled decay, arxiv 2502.16982). The two need
 # different MATRIX_LR -- at the same LR a Moonlight update is 0.2*sqrt(max(m,n)) larger.
+# FP8 for the linear layers (nanochat/fp8.py, torch._scaled_mm). Needs FP8 tensor
+# cores to pay off: worthwhile on sm_100 (B200/B300), pointless on GB10. Both arms of
+# a comparison must agree on this, or the comparison measures FP8 too.
+FP8="${FP8:-0}"
+FP8_RECIPE="${FP8_RECIPE:-tensorwise}"   # tensorwise (faster) | rowwise (more accurate)
+
 MUON_VARIANT="${MUON_VARIANT:-nanochat}"
 # Default LR follows the variant. 0.004 for moonlight was calibrated on this repo by
 # matching the measured update:param ratio of the default variant at its own LR
@@ -562,6 +574,8 @@ cat > "$RUN_DIR/config.json" <<JSON
   "aspect_ratio": $ASPECT_RATIO,
   "optimizer": "MuonAdamW (Muon on matrices, AdamW on embeddings/scalars)",
   "muon_variant": "$MUON_VARIANT",
+  "fp8": $([ "$FP8" = "1" ] && echo true || echo false),
+  "fp8_recipe": "$FP8_RECIPE",
   "device_batch_size": $DEVICE_BATCH_SIZE,
   "total_batch_size": $TOTAL_BATCH_SIZE,
   "matrix_lr": $MATRIX_LR,
@@ -617,6 +631,9 @@ TRAIN_ARGS=(
     --model-tag="$RUN_ID"
     --run="$WANDB_RUN"
 )
+if [ "$FP8" = "1" ]; then
+    TRAIN_ARGS+=(--fp8 --fp8-recipe="$FP8_RECIPE")
+fi
 if [ "$NUM_ITERATIONS" -gt 0 ]; then
     TRAIN_ARGS+=(--num-iterations="$NUM_ITERATIONS")
 else
