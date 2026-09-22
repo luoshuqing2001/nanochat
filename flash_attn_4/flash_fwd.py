@@ -1059,7 +1059,12 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                     smem_pipe_write = self.advance_pipeline(smem_pipe_write)
             # The remaining iterations have no masking
-            for n_tile in cutlass.range(n_block, unroll=1):
+            # LOCAL PATCH (nanochat): stop at n_block_min instead of 0. This is the
+            # "TODO: local" below: for sliding-window attention the blocks under the
+            # window were being computed and then thrown away by the mask, so a windowed
+            # forward cost exactly as much as a full-causal one. Identical to upstream
+            # whenever n_block_min is 0, which is every non-local case.
+            for n_tile in cutlass.range(n_block - n_block_min, unroll=1):
                 compute_one_n_block(
                     n_block - n_tile - 1, smem_pipe_read, smem_pipe_write,
                     seqlen=seqlen, is_first_n_block=False,
