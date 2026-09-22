@@ -82,6 +82,17 @@ def main():
     ap.add_argument("--yes", action="store_true", help="actually delete when --prune is given")
     args = ap.parse_args()
 
+    # Default to the same directory the launcher reads from. Without this, the shards
+    # land in $NANOCHAT_BASE_DIR/base_data_climbmix (nanochat.dataset's default) while
+    # _engine_hybrid_swa_muon.sh looks in <repo>/base_data_climbmix, and the preflight
+    # fails after a 200 GB download. Must be set before nanochat.dataset is imported,
+    # since it resolves DATA_DIR at import time.
+    if not os.environ.get("NANOCHAT_DATA_DIR"):
+        repo_default = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                    "base_data_climbmix")
+        os.environ["NANOCHAT_DATA_DIR"] = repo_default
+        print(f"NANOCHAT_DATA_DIR not set, defaulting to the launcher's location: {repo_default}")
+
     import nanochat.dataset as ds  # honors NANOCHAT_DATA_DIR
 
     if args.depth:
