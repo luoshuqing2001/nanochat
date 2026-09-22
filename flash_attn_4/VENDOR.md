@@ -270,8 +270,36 @@ reproduced inside FA4's own machinery, and the CuTe version is the better one: a
 B1 T8192 H1 the Triton kernel went 0.57 -> 0.47 ms with splits, where this one starts
 at 0.452 and reaches 0.320.
 
-`num_splits` therefore defaults to 1 and `softplus_attn_fa4_func` (the training path)
-never splits.
+`num_splits` therefore defaults to 1. It is still reachable from training --
+`NANOCHAT_SOFTPLUS_SPLITS=4` -- because the idea is worth being able to re-test, and
+because the end-to-end answer is sharper than the kernel one. d12/bs32 on GB10:
+
+| | step | tok/s | attention |
+|---|---|---|---|
+| splits=1 | 1268.3 ms | 51,672 | 271.0 ms |
+| splits=2 | 1327.7 ms | 49,362 | 319.4 ms |
+| splits=4 | 1342.9 ms | 48,802 | 343.6 ms |
+| splits=8 | 1362.7 ms | 48,092 | 380.5 ms |
+
+Monotonically worse, and that is the experiment that settles it: if causal load
+imbalance were costing anything at this shape, splits=2 would recover *some* of it.
+It does not -- it costs 18% more attention time.
+
+Two reasons, and it is worth separating them because only the first is about softplus:
+
+- **Uniform splitting does not equalize anything.** It divides each query tile's *own*
+  key range into S parts, so every program shrinks by the same factor and the ratio
+  between the longest and the shortest is unchanged. At d12/bs32 the key blocks per
+  query tile run 2..32, a 16:1 spread, and at S=2 it is still 16:1. What splitting
+  actually shortens is the critical path, which only matters when the critical path is
+  what you are waiting for. The technique that *equalizes* is tile pairing -- run query
+  tile m and tile N-1-m in one program, so every program does N+1 blocks -- and it costs
+  no atomics and no extra programs.
+- **There is no imbalance left to recover at training shapes.** d12/bs32 launches
+  32 x 6 x 16 = 3072 query-tile programs onto 48 SMs, 64 waves deep. An SM that finishes
+  a short tile picks up the next one immediately, so imbalance can only cost part of the
+  final wave, about 1/64. Splitting then adds 64x more programs, fp32 output writes,
+  atomic contention and a zero-and-cast pass to chase it.
 
 ### Where splitting does pay: long-context inference
 

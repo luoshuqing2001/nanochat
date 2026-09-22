@@ -60,6 +60,8 @@ def main():
     ap.add_argument("--fp8", action="store_true")
     ap.add_argument("--fp8-recipe", type=str, default="tensorwise")
     ap.add_argument("--muon-variant", type=str, default="nanochat")
+    ap.add_argument("--attn-kind", type=str, default="softmax", choices=("softmax", "softplus"))
+    ap.add_argument("--softplus-alpha", type=float, default=1.0)
     ap.add_argument("--no-compile", action="store_true")
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--steps", type=int, default=5)
@@ -75,7 +77,8 @@ def main():
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     cfg = GPTConfig(sequence_len=T, vocab_size=args.vocab_size, n_layer=args.depth,
                     n_head=model_dim // args.head_dim, n_kv_head=model_dim // args.head_dim,
-                    n_embd=model_dim, window_pattern=args.window_pattern)
+                    n_embd=model_dim, window_pattern=args.window_pattern,
+                    attn_kind=args.attn_kind, softplus_alpha=args.softplus_alpha)
     with torch.device("meta"):
         model = GPT(cfg)
     model.to_empty(device=dev)
@@ -106,8 +109,13 @@ def main():
         opt.step()
         model.zero_grad(set_to_none=True)
 
+    attn_desc = args.attn_kind
+    if args.attn_kind == "softplus":
+        from nanochat.softplus_attention import softplus_impl_name
+        attn_desc += f" ({softplus_impl_name((511, 0))}/{softplus_impl_name((-1, 0))})"
     print(f"d{args.depth} dim {model_dim} | B={B} T={T} | dtype {COMPUTE_DTYPE} | "
-          f"compile={'off' if args.no_compile else 'on'} | {flops_per_token:.3e} FLOPs/token")
+          f"compile={'off' if args.no_compile else 'on'} | attn {attn_desc} | "
+          f"{flops_per_token:.3e} FLOPs/token")
     print(f"warmup {args.warmup} steps (compile + JIT)...")
     for _ in range(args.warmup):
         step()

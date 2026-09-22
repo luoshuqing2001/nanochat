@@ -31,6 +31,7 @@ the FA3 (left, right) tuple with -1 meaning unlimited, and only right = 0 (causa
 supported.
 """
 
+import os
 import torch
 import triton
 import triton.language as tl
@@ -483,10 +484,90 @@ def softplus_attn_func(q, k, v, causal=True, window_size=(-1, 0), alpha=1.0, sof
     return torch.ops.softplus_attn.fwd(q, k, v, window, float(alpha), float(scale))
 
 
+# =============================================================================
+# Backend selection
+#
+# The kernels above are the Triton implementation. flash_attn_4/flash_fwd_softplus.py
+# is a second one that runs FA4's own mainloop; it is faster on both layer types and is
+# the default. NANOCHAT_SOFTPLUS_IMPL picks between them:
+#
+#   fa4     (default) FA4's mainloop for everything
+#   triton  the kernels in this file
+#   mixed   triton for windowed layers, fa4 for full-causal ones
+#
+# Measured on 1x GB10, B8 T2048 H12 D128, attention fwd+bwd, median of 5, against FA4
+# softmax at 5.736 ms (windowed) / 8.583 ms (full causal):
+#
+#                     windowed        full causal     SSSL mix
+#   triton            5.223 (1.098x)  9.360 (0.917x)  1.031x
+#   fa4               5.373 (1.068x)  8.231 (1.043x)  1.059x
+#   mixed             5.223           8.231           1.079x
+#
+# `mixed` is the fastest and also the most fragile -- it is one machine's crossover,
+# and it comes from FA4 accumulating dQ atomically into an fp32 buffer and converting it
+# in a second pass, a fixed cost that a short windowed backward feels more. `fa4` is the
+# default because it beats softmax on both layer types with one implementation.
+# =============================================================================
+
+_SOFTPLUS_IMPL = os.environ.get("NANOCHAT_SOFTPLUS_IMPL", "fa4")
+
+# Forward tile splitting for the fa4 backend during *training*. Off by default; see
+# softplus_attn_fa4_func. NANOCHAT_SOFTPLUS_SPLITS=4 turns it on for an A/B.
+_SOFTPLUS_SPLITS = int(os.environ.get("NANOCHAT_SOFTPLUS_SPLITS", "1"))
+
+
+def _load_fa4_softplus():
+    try:
+        from flash_attn_4.softplus_api import softplus_attn_fa4, softplus_attn_fa4_func
+        return softplus_attn_fa4, softplus_attn_fa4_func
+    except Exception:
+        return None, None
+
+
+_FA4_FWD, _FA4_FUNC = _load_fa4_softplus()
+HAS_FA4_SOFTPLUS = _FA4_FUNC is not None
+
+
+def _left_window(window_size, seqlen_k):
+    """(left, right) as nanochat passes it -> the left bound FA4 wants, or None."""
+    left = window_size[0] if window_size is not None else None
+    if left is None or left < 0 or left >= seqlen_k:
+        return None
+    return int(left)
+
+
+def softplus_impl_name(window_size=None):
+    """Which backend a layer with this window actually runs on: 'fa4' | 'triton'."""
+    if not HAS_FA4_SOFTPLUS:
+        return "triton"
+    if _SOFTPLUS_IMPL == "mixed":
+        return "triton" if (window_size is not None and window_size[0] is not None
+                            and window_size[0] >= 0) else "fa4"
+    return "fa4" if _SOFTPLUS_IMPL == "fa4" else "triton"
+
+
+def softplus_attention(q, k, v, window_size=(-1, 0), alpha=1.0):
+    """Training entry point. q, k, v are (B, T, H, D); causal only."""
+    if softplus_impl_name(window_size) == "fa4":
+        return _FA4_FUNC(q, k, v, causal=True,
+                         window_size=(_left_window(window_size, k.size(1)), 0), alpha=alpha,
+                         num_splits=_SOFTPLUS_SPLITS)
+    return softplus_attn_func(q, k, v, causal=True, window_size=window_size, alpha=alpha)
+
+
 def softplus_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
                                causal=True, window_size=(-1, 0), alpha=1.0, softmax_scale=None):
-    """Inference path. Materialises the scores: q is one token during decode and a prompt
-    during prefill, so the Tq x context matrix is small and a kernel would not pay off."""
+    """Inference path.
+
+    Uses FA4's softplus kernel with tile splitting when it is available. Decode is what
+    splitting exists for: one query token against a long cache is a handful of programs
+    on 48 SMs, and cutting the key range is the only parallelism left. `num_splits="auto"`
+    sizes it from the shape -- 6.0x against a 4k cache, 2.8x against 64k, and 1 whenever
+    the machine is already full.
+
+    The fallback materialises the Tq x context score matrix in float32, which is fine for
+    a single decode step and quadratic for a long prefill.
+    """
     B, Tq, H, D = q.shape
     pos = int(cache_seqlens[0].item())
     if k is not None and v is not None:
@@ -494,6 +575,9 @@ def softplus_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlen
         v_cache[:, pos:pos + Tq] = v
     end = pos + Tq
     ks, vs = k_cache[:, :end], v_cache[:, :end]
+    if HAS_FA4_SOFTPLUS and _SOFTPLUS_IMPL != "materialize":
+        return _FA4_FWD(q, ks, vs, True, (_left_window(window_size, end), 0),
+                        alpha, softmax_scale, num_splits="auto")
     scale = D ** -0.5 if softmax_scale is None else softmax_scale
     s = torch.einsum("bqhd,bkhd->bhqk", q.float(), ks.float()) * scale
     row = torch.arange(end - Tq, end, device=q.device)[:, None]

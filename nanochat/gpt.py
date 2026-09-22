@@ -112,9 +112,11 @@ class CausalSelfAttention(nn.Module):
         # Flash Attention (FA3 or SDPA fallback)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if self.attn_kind == "softplus":
-            from nanochat.softplus_attention import softplus_attn_func, softplus_attn_with_kvcache
+            # Backend (FA4's mainloop or the standalone Triton kernels) is chosen inside
+            # softplus_attention; NANOCHAT_SOFTPLUS_IMPL overrides it.
+            from nanochat.softplus_attention import softplus_attention, softplus_attn_with_kvcache
             if kv_cache is None:
-                y = softplus_attn_func(q, k, v, causal=True, window_size=window_size,
+                y = softplus_attention(q, k, v, window_size=window_size,
                                        alpha=self.softplus_alpha)
             else:
                 k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)

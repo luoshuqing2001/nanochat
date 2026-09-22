@@ -94,51 +94,94 @@ def softplus_attn_fa4(
     return o.to(q.dtype) if num_splits > 1 else o
 
 
-class _SoftplusAttnFA4(torch.autograd.Function):
-    """Autograd wrapper: FA4's mainloop for both directions.
+# Registered as torch.library custom ops rather than a plain autograd.Function. Dynamo
+# does not break the graph on either, but an autograd.Function's backward stays outside
+# the inductor graph, so the elementwise work around it -- the QKV split's gradient
+# accumulation above all -- can no longer fuse. That cost 171 ms of extra elementwise
+# time and an eager 107 ms CUDAFunctor_add on a d12/bs32 step, turning a 15% faster
+# attention into an 8% slower step. FA4's softmax path (fa3_compat.py) and the Triton
+# softplus kernel both use custom ops for the same reason.
 
-    The backward carries no LSE and runs no preprocess pass, because softplus needs
-    neither -- see flash_bwd_softplus.py. Splitting is forward-only, so training uses
-    num_splits=1 and gets nothing from this class it would not get from the plain call.
-    """
 
-    @staticmethod
-    def forward(ctx, q, k, v, left, alpha, scale):
-        from flash_attn_4.interface import _flash_attn_fwd
+@torch.library.custom_op("softplus_attn_fa4::fwd", mutates_args=(), device_types="cuda")
+def _op_fwd_fa4(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                window: int, alpha: float, scale: float, splits: int) -> torch.Tensor:
+    from flash_attn_4.interface import _flash_attn_fwd
 
-        out, *_ = _flash_attn_fwd(
-            q, k, v, softmax_scale=scale, causal=left is None,
-            window_size_left=left, window_size_right=0 if left is not None else None,
-            attn_kind="softplus", softplus_alpha=alpha,
-        )
-        ctx.save_for_backward(q, k, v, out)
-        ctx.left, ctx.alpha, ctx.scale = left, alpha, scale
-        return out
+    left = None if window < 0 else window
+    # splits > 1 aggregates with atomic_add into a zeroed fp32 buffer.
+    out = None
+    if splits > 1:
+        out = torch.zeros(*q.shape[:-1], v.shape[-1], dtype=torch.float32, device=q.device)
+    o, *_ = _flash_attn_fwd(
+        q, k, v, softmax_scale=scale, causal=left is None,
+        window_size_left=left, window_size_right=0 if left is not None else None,
+        attn_kind="softplus", softplus_alpha=alpha, softplus_num_splits=splits, out=out,
+    )
+    return o.to(q.dtype) if splits > 1 else o
 
-    @staticmethod
-    def backward(ctx, dout):
-        from flash_attn_4.interface import _flash_attn_bwd
 
-        q, k, v, out = ctx.saved_tensors
-        left = ctx.left
-        # `lse` is unused by the softplus backward but the signature wants a tensor.
-        lse = torch.empty(q.shape[0], q.shape[2], q.shape[1], dtype=torch.float32, device=q.device)
-        dq, dk, dv, *_ = _flash_attn_bwd(
-            q, k, v, out, dout.contiguous(), lse,
-            softmax_scale=ctx.scale, causal=left is None,
-            window_size_left=left, window_size_right=0 if left is not None else None,
-            attn_kind="softplus", softplus_alpha=ctx.alpha,
-        )
-        return dq, dk, dv, None, None, None
+@_op_fwd_fa4.register_fake
+def _(q, k, v, window, alpha, scale, splits):
+    return torch.empty_like(q)
+
+
+@torch.library.custom_op("softplus_attn_fa4::bwd", mutates_args=(), device_types="cuda")
+def _op_bwd_fa4(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor,
+                do: torch.Tensor, window: int, alpha: float,
+                scale: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from flash_attn_4.interface import _flash_attn_bwd
+
+    left = None if window < 0 else window
+    # The softplus backward reads no LSE; the signature still wants a tensor.
+    lse = torch.empty(q.shape[0], q.shape[2], q.shape[1], dtype=torch.float32, device=q.device)
+    dq, dk, dv, *_ = _flash_attn_bwd(
+        q, k, v, out, do.contiguous(), lse,
+        softmax_scale=scale, causal=left is None,
+        window_size_left=left, window_size_right=0 if left is not None else None,
+        attn_kind="softplus", softplus_alpha=alpha,
+    )
+    return dq, dk, dv
+
+
+@_op_bwd_fa4.register_fake
+def _(q, k, v, out, do, window, alpha, scale):
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+
+def _setup_context_fa4(ctx, inputs, output):
+    q, k, v, window, alpha, scale, _splits = inputs
+    ctx.save_for_backward(q, k, v, output)
+    ctx.window, ctx.alpha, ctx.scale = window, alpha, scale
+
+
+def _backward_fa4(ctx, do):
+    q, k, v, out = ctx.saved_tensors
+    dq, dk, dv = torch.ops.softplus_attn_fa4.bwd(
+        q, k, v, out, do, ctx.window, ctx.alpha, ctx.scale
+    )
+    return dq, dk, dv, None, None, None, None
+
+
+torch.library.register_autograd(
+    "softplus_attn_fa4::fwd", _backward_fa4, setup_context=_setup_context_fa4
+)
 
 
 def softplus_attn_fa4_func(q, k, v, causal=True, window_size=(None, None),
-                           alpha=1.0, softmax_scale=None):
-    """Differentiable softplus attention, forward and backward both in CuTe."""
+                           alpha=1.0, softmax_scale=None, num_splits=1):
+    """Differentiable softplus attention, forward and backward both in CuTe.
+
+    `num_splits` > 1 splits the forward's key range and aggregates with atomic_add; the
+    backward is unaffected, since it already parallelises over KV blocks. It is off by
+    default because at training shapes there is no load to balance -- d12/bs32 launches
+    3072 query-tile programs onto 48 SMs, 64 waves, and the hardware scheduler evens
+    that out by itself. Measure before turning it on.
+    """
     left, right = window_size
-    if left is not None and (left < 0 or left >= k.size(1)):
-        left = None
     assert causal, "softplus attention is causal-only here"
     assert right in (0, None), "only a zero right window is supported"
+    window = -1 if left is None or left < 0 or left >= k.size(1) else int(left)
     scale = q.shape[-1] ** -0.5 if softmax_scale is None else float(softmax_scale)
-    return _SoftplusAttnFA4.apply(q, k, v, left, float(alpha), scale)
+    return torch.ops.softplus_attn_fa4.fwd(q, k, v, window, float(alpha), scale,
+                                           int(num_splits))

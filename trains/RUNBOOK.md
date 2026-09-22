@@ -207,6 +207,7 @@ claim at 100B, and cross-budget losses are not comparable at all.
 | throughput far below a previous measurement | someone else is on the GPU | `nvidia-smi --query-compute-apps=pid,used_memory --format=csv` |
 | bpb suddenly incomparable with earlier runs | the validation shard changed, or the tokenizer was re-trained | keep `--val-shard 2499`; never run `python -m nanochat.dataset -n N` (it also pulls shard_06542, which sorts last and becomes val) |
 | MFU prints 0.00 | the GPU is not in `get_peak_flops()` in `nanochat/common.py` | b200 is in the table; b300 and GB10 are not |
+| a kernel gets faster but the step gets slower | a `torch.autograd.Function` wrapping it: dynamo does not break the graph, but its backward stays *outside* the inductor graph, so surrounding elementwise work stops fusing | register the kernel as a `torch.library` custom op with `register_autograd`, as `flash_attn_4/fa3_compat.py` and `nanochat/softplus_attention.py` do. Counting graph breaks will not find this -- it was 0 either way; compare the elementwise category instead |
 
 ## Where a step's time actually goes on GB10, and what does not help
 

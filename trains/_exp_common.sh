@@ -18,12 +18,14 @@ unset DEPTH WINDOW_PATTERN MAX_SEQ_LEN HEAD_DIM ASPECT_RATIO \
       NUM_ITERATIONS TARGET_PARAM_DATA_RATIO TARGET_FLOPS \
       EVAL_EVERY EVAL_TOKENS SAMPLE_EVERY SAVE_EVERY CORE_METRIC_EVERY DIAGNOSTICS_EVERY \
       FINAL_EVAL FINAL_EVAL_SPLIT_TOKENS FINAL_EVAL_MAX_PER_TASK \
-      LOSS_CHUNK_TOKENS FP8 FP8_RECIPE RUN_NAME 2>/dev/null || true
+      LOSS_CHUNK_TOKENS FP8 FP8_RECIPE RUN_NAME \
+      ATTN_KIND SOFTPLUS_ALPHA NANOCHAT_SOFTPLUS_IMPL 2>/dev/null || true
 
 run_experiment() {
     local depth="$1"; shift
     echo "experiment: d${depth} | arm '${MUON_VARIANT}' | ${EXP_TOKENS} tokens"\
-         "(ratio ${TARGET_PARAM_DATA_RATIO}) | bs ${DEVICE_BATCH_SIZE} | FP8 ${FP8}"
+         "(ratio ${TARGET_PARAM_DATA_RATIO}) | bs ${DEVICE_BATCH_SIZE} | FP8 ${FP8}"\
+         "| attn ${ATTN_KIND:-softmax}"
     if [ -n "${RESUME:-}" ]; then
         exec bash trains/resume_latest.sh "$RESUME" --keep 2 "$@"
     fi
