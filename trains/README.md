@@ -237,21 +237,30 @@ MUON_VARIANT=nanochat bash trains/exp_d20_60b.sh   # its baseline arm
 RESUME=<run_id> bash trains/exp_d20_60b.sh         # after a container restart
 ```
 
-All of them use the same `TARGET_PARAM_DATA_RATIO=138`, i.e. the same tokens per
-scaling parameter. That is deliberate: a control trained to a different length than
-the run it controls for confounds size with training duration, and no statement
-about how an effect moves with scale survives that. Matching it is also cheap --
-on one B200 at the 937 TFLOPS measured there:
+The ablation tier and the headline run use **different** budgets, which is what the
+architecture literature does: a cheap fixed config for sweeping variants, a larger one
+for the result that gets compared against published numbers. [GLA](https://arxiv.org/pdf/2312.06635),
+[Gated Slot Attention](https://proceedings.neurips.cc/paper_files/paper/2024/file/d3f39e51f5f634fb16cc3e658f8512b9-Paper-Conference.pdf)
+and the DeltaNet line all run 340M/15B and 1.3B/100B; others use 600M/15B and 2B/100B.
+Those tiers do not share a tokens-per-parameter ratio (44 vs 77) and nobody fits a
+scaling law across them.
 
-| | params | tokens | steps | wall clock |
-|---|---|---|---|---|
-| d12 | 286M | 15.2B | 28,980 | ~3.4 h |
-| d16 | 537M | 32.4B | 61,824 | ~15.2 h |
-| d20 | 897M | 60.1B | 57,270 | ~51 h |
+| | params | tokens | tok/param | steps | wall clock (1x B200) |
+|---|---|---|---|---|---|
+| d12 ablation | 286M | 15.0B | 52 | 28,560 | ~3.4 h |
+| d16 ablation | 537M | 15.0B | 28 | 28,672 | ~7.1 h |
+| d20 headline | 897M | 60.1B | 67 | 57,270 | ~51 h |
 
-Cheaper points exist for screening, where no cross-size claim is made:
-`TARGET_PARAM_DATA_RATIO=12` is compute-optimal (d12: 1.3B tokens, 0.3 h; d16: 2.8B,
-1.3 h), and 52 / 46 give Chinchilla's 20 tokens per total parameter.
+What has to hold is that **both arms at a given size see the same budget** -- hence the
+files, rather than exports typed by hand. What this design does not support is a precise
+claim about how an effect scales between sizes, since duration varies with size too; the
+statement it buys is "the effect is present at both scales".
+
+Override for a different budget, e.g. compute-optimal screening:
+
+```bash
+TARGET_PARAM_DATA_RATIO=12 bash trains/exp_d12_ctrl.sh    # 1.3B tokens, 0.3 h
+```
 
 ### Chunked loss head
 

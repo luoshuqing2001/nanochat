@@ -7,16 +7,19 @@
 #   RESUME=<run_id> bash trains/exp_d16_ctrl.sh        # continue after a restart
 #   DRY_RUN=1 bash trains/exp_d16_ctrl.sh              # print the config, do not train
 #
-# The token budget defaults to the *same* tokens-per-scaling-param as the d20/60B run
-# (TARGET_PARAM_DATA_RATIO=138), not to a cheaper compute-optimal point. A control
-# trained for a different duration than the run it controls for cannot support any
-# statement about how an effect moves with scale -- size and training length would be
-# confounded. At 138 this size is 32.4B tokens, ~61,824 steps, about 15.2 h on one
-# B200 at the 937 TFLOPS measured there, which is cheap next to the d20 run's ~51 h.
+# The token budget is an absolute 15.0B, not a ratio carried over from the d20 run.
+# That follows what the architecture literature actually does: a cheap fixed config for
+# the ablation sweep and a separate, larger one for the headline result -- 340M/15B and
+# 1.3B/100B in GLA, Gated Slot Attention and the DeltaNet line, 600M/15B and 2B/100B
+# elsewhere. Those two tiers do not share a tokens-per-parameter ratio (44 vs 77), and
+# no one fits a scaling law across them; each tier is compared within itself.
 #
-# Cheaper points, for screening only (no cross-size claim):
-#   TARGET_PARAM_DATA_RATIO=12   compute-optimal, 2.8B / 1.3 h
-#   TARGET_PARAM_DATA_RATIO=46   Chinchilla 20x total params, 10.8B / 5.1 h
+# So: 15.0B here (28 tokens/param, ~28,672 steps, about 7.1 h on one B200 at the
+# 937 TFLOPS measured there) against 60B for d20. What must hold is that both arms at
+# *this* size see the same budget, which is why it is pinned here rather than exported
+# by hand. What this tier cannot support is a precise claim about how an effect scales
+# between sizes, since duration varies too; "the gain is present at both scales" is the
+# statement this design buys.
 #
 #   d16: dim 1024, 8 heads x 128, 536,871,738 params (234,881,792 scaling params)
 # =============================================================================
@@ -28,7 +31,7 @@ unset NUM_ITERATIONS RUN_NAME TARGET_FLOPS 2>/dev/null || true
 export MUON_VARIANT="${MUON_VARIANT:-moonlight}"
 export FP8="${FP8:-1}"
 export FP8_RECIPE="${FP8_RECIPE:-tensorwise}"
-export TARGET_PARAM_DATA_RATIO="${TARGET_PARAM_DATA_RATIO:-138}"
+export TARGET_PARAM_DATA_RATIO="${TARGET_PARAM_DATA_RATIO:-64}"   # 15.0B tokens
 export DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-64}"
 export SAVE_EVERY="${SAVE_EVERY:-10000}"
 export EVAL_EVERY="${EVAL_EVERY:-2000}"
