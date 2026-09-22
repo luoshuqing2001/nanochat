@@ -38,8 +38,13 @@ import triton.language as tl
 
 @triton.jit
 def _softplus(x):
-    # log1p(exp(x)) without overflow: the two branches agree to fp32 precision by |x| ~ 20
-    return tl.where(x > 20.0, x, tl.log(1.0 + tl.exp(tl.minimum(x, 20.0))))
+    """softplus(s) = max(s, 0) + log(1 + exp(-|s|)).
+
+    Algebraically identical to log(1 + exp(s)), but the exponent is never positive, so
+    the exponential cannot overflow for any input and no branch or clamp on magnitude is
+    needed. The branchy form this replaced (return s above a threshold) also dropped the
+    log term there, which this keeps."""
+    return tl.maximum(x, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(x)))
 
 
 @triton.jit
