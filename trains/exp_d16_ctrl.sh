@@ -31,7 +31,10 @@ unset NUM_ITERATIONS RUN_NAME TARGET_FLOPS 2>/dev/null || true
 export MUON_VARIANT="${MUON_VARIANT:-moonlight}"
 export FP8="${FP8:-1}"
 export FP8_RECIPE="${FP8_RECIPE:-tensorwise}"
-export TARGET_PARAM_DATA_RATIO="${TARGET_PARAM_DATA_RATIO:-51}"   # 12.0B tokens
+# Pinned, not overridable: the budget *is* the experiment, and an exported
+# TARGET_PARAM_DATA_RATIO left over from another size silently retargets this run.
+# To change it, edit this line, so the change lands in git with the results.
+export TARGET_PARAM_DATA_RATIO=51   # 12.0B tokens
 export DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-64}"
 export SAVE_EVERY="${SAVE_EVERY:-5000}"
 export EVAL_EVERY="${EVAL_EVERY:-1000}"
