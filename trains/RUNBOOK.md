@@ -207,3 +207,45 @@ claim at 100B, and cross-budget losses are not comparable at all.
 | throughput far below a previous measurement | someone else is on the GPU | `nvidia-smi --query-compute-apps=pid,used_memory --format=csv` |
 | bpb suddenly incomparable with earlier runs | the validation shard changed, or the tokenizer was re-trained | keep `--val-shard 2499`; never run `python -m nanochat.dataset -n N` (it also pulls shard_06542, which sorts last and becomes val) |
 | MFU prints 0.00 | the GPU is not in `get_peak_flops()` in `nanochat/common.py` | b200 is in the table; b300 and GB10 are not |
+
+## Where a step's time actually goes on GB10, and what does not help
+
+`python trains/profile_step.py --depth 12 --device-batch-size 32` on an idle GB10,
+bf16, batch 32, seq 2048, d12 (1354.6 ms/step, 48,380 tok/s):
+
+| | |
+|---|---|
+| GEMM bf16 | 46.8% |
+| elementwise / norm | 31.1% |
+| attention (FA4) | 10.7% |
+| optimizer (MuonAdamW) | 6.3% |
+| loss / softmax | 4.0% |
+| other | 1.1% |
+
+Summed kernel time is within a few percent of wall time, so the GPU is busy and there
+is nothing to win from launch overlap. During the GEMMs the machine runs at roughly
+63% of its bf16 peak, so those are close to done. That leaves the other 53% of the
+step, and the largest single item in it is the MLP's `relu(x).square()` -- 7.8% of the
+step across forward and backward, which is pure memory traffic on a (B*T, 4*dim)
+tensor and would disappear if it fused into the c_fc epilogue.
+
+Measured and rejected, all on the same shape:
+
+| idea | result |
+|---|---|
+| FP8 (`--fp8`, tensorwise) | **1426.5 ms, 5% slower**, and 33.1 vs 27.4 GiB. Total GEMM time goes *up* (1442.7 -> 1583.6 ms): fp8 GEMMs are not faster than bf16 here, and the quantize/scale passes add ~458 ms. FP8 is a B200 win, not a GB10 one. |
+| `torch.compile(mode="max-autotune")` | 1379.5 ms, no change. Inductor benchmarks its Triton GEMM template against cuBLAS and picks cuBLAS, so the relu^2 epilogue never fuses. |
+| forcing the Triton GEMM template | does not compile: no template covers the 24-wide `smear_gate` linear, and ATEN is disabled as a fallback. |
+| softplus attention in CuTe | ~1% (see `flash_attn_4/VENDOR.md`). |
+| bounding the SWA forward by the window | +0.7% (commit 983f221); the kernel itself is 1.55x but attention is only a tenth of the step. |
+
+So on GB10 there is no large, safe win left. `ns_steps=5` in the Muon groups is the one
+untouched knob with real time behind it (6.3% of the step is the optimizer, and the
+Polar Express iterations are most of that), but cutting it changes the optimization,
+not just the speed.
+
+Note both numbers above are post-fix: `profile_step.py` used to count CPU-side ops and
+their CUDA kernels in the same total, which roughly doubled it, and it bucketed cuBLAS's
+`nvjet_*` Blackwell GEMMs as "other", which made the model look far more bandwidth-bound
+than it is. Earlier attributions from this script -- including "attention is 11.7% of a
+step" -- came from that broken denominator.

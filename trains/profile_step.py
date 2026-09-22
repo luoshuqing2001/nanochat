@@ -29,7 +29,10 @@ from nanochat.gpt import GPT, GPTConfig
 BUCKETS = [
     ("attention (FA4/SDPA)", ("flash", "fmha", "attention", "sm100_fmha", "sm120_fmha")),
     ("GEMM fp8", ("scaled_mm", "float8", "fp8")),
-    ("GEMM bf16", ("gemm", "cutlass", "ampere", "sm90", "sm100", "sm80", "matmul", "addmm", " mm ")),
+    # nvjet_* is cuBLAS's Blackwell GEMM family; without it the bulk of the GEMM time
+    # lands in "other" and the model looks far more bandwidth-bound than it is.
+    ("GEMM bf16", ("gemm", "cutlass", "ampere", "nvjet", "sm90", "sm100", "sm80",
+                   "matmul", "addmm", " mm ")),
     ("loss / softmax", ("softmax", "cross_entropy", "nll", "tanh")),
     ("optimizer", ("muon", "adamw", "foreach", "polar")),
     ("collectives", ("nccl", "all_reduce", "reduce_scatter", "all_gather")),
@@ -129,7 +132,16 @@ def main():
             step()
         torch.cuda.synchronize()
 
-    events = [e for e in prof.key_averages() if e.self_device_time_total > 0]
+    # Only real CUDA kernels. key_averages() also carries the CPU-side ops that
+    # launched them, and an op's self_device_time_total counts its kernels' time, so
+    # including both double-counts: the totals came out at roughly twice the measured
+    # step time and the split between categories was distorted, since an op and its
+    # kernel do not always share a name.
+    from torch.autograd import DeviceType
+    events = [
+        e for e in prof.key_averages()
+        if e.self_device_time_total > 0 and e.device_type == DeviceType.CUDA
+    ]
     total = sum(e.self_device_time_total for e in events)
     groups = {}
     for e in events:
