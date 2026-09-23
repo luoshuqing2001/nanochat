@@ -172,7 +172,7 @@ def softplus_attn_fa4(
 @torch.library.custom_op("softplus_attn_fa4::fwd", mutates_args=(), device_types="cuda")
 def _op_fwd_fa4(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 window: int, alpha: float, scale: float, splits: int,
-                m_chunk: int) -> torch.Tensor:
+                m_chunk: int, bwd_impl: int) -> torch.Tensor:
     from flash_attn_4.interface import _flash_attn_fwd
 
     left = None if window < 0 else window
@@ -189,7 +189,7 @@ def _op_fwd_fa4(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 
 
 @_op_fwd_fa4.register_fake
-def _(q, k, v, window, alpha, scale, splits, m_chunk):
+def _(q, k, v, window, alpha, scale, splits, m_chunk, bwd_impl):
     return torch.empty_like(q)
 
 
@@ -218,17 +218,32 @@ def _(q, k, v, out, do, window, alpha, scale, m_chunk):
 
 
 def _setup_context_fa4(ctx, inputs, output):
-    q, k, v, window, alpha, scale, _splits, m_chunk = inputs
+    q, k, v, window, alpha, scale, _splits, m_chunk, bwd_impl = inputs
     ctx.save_for_backward(q, k, v, output)
     ctx.window, ctx.alpha, ctx.scale, ctx.m_chunk = window, alpha, scale, m_chunk
+    ctx.bwd_impl = bwd_impl
 
 
 def _backward_fa4(ctx, do):
     q, k, v, out = ctx.saved_tensors
-    dq, dk, dv = torch.ops.softplus_attn_fa4.bwd(
-        q, k, v, out, do, ctx.window, ctx.alpha, ctx.scale, ctx.m_chunk
-    )
-    return dq, dk, dv, None, None, None, None, None
+    if ctx.bwd_impl == 1:
+        # Triton backward under FA4's forward. FA4 accumulates dQ atomically into a 96 MiB
+        # fp32 buffer and converts it in a second pass -- 1.22 ms of pure bandwidth per
+        # call, both passes already at the machine's roof, so it is a fixed cost that a
+        # short windowed backward feels more than a full-causal one. The Triton backward
+        # keeps dQ in registers and pays recompute instead, which is the better trade for
+        # a window: 3.923 vs 4.280 ms at B8 T2048 H12 W=512, and the other way round
+        # without a window.
+        import nanochat.softplus_attention  # registers softplus_attn::bwd
+
+        dq, dk, dv = torch.ops.softplus_attn.bwd(
+            q, k, v, do, ctx.window, ctx.alpha, ctx.scale
+        )
+    else:
+        dq, dk, dv = torch.ops.softplus_attn_fa4.bwd(
+            q, k, v, out, do, ctx.window, ctx.alpha, ctx.scale, ctx.m_chunk
+        )
+    return dq, dk, dv, None, None, None, None, None, None
 
 
 torch.library.register_autograd(
@@ -237,7 +252,8 @@ torch.library.register_autograd(
 
 
 def softplus_attn_fa4_func(q, k, v, causal=True, window_size=(None, None),
-                           alpha=1.0, softmax_scale=None, num_splits=1, bwd_m_chunk="auto"):
+                           alpha=1.0, softmax_scale=None, num_splits=1, bwd_m_chunk="auto",
+                           bwd_impl=0):
     """Differentiable softplus attention, forward and backward both in CuTe.
 
     `num_splits` > 1 splits the forward's key range and aggregates with atomic_add; the
@@ -258,4 +274,4 @@ def softplus_attn_fa4_func(q, k, v, causal=True, window_size=(None, None),
             window_right=None if window < 0 else 0,
         ) or 0
     return torch.ops.softplus_attn_fa4.fwd(q, k, v, window, float(alpha), scale,
-                                           int(num_splits), int(bwd_m_chunk))
+                                           int(num_splits), int(bwd_m_chunk), int(bwd_impl))

@@ -491,25 +491,32 @@ def softplus_attn_func(q, k, v, causal=True, window_size=(-1, 0), alpha=1.0, sof
 # is a second one that runs FA4's own mainloop; it is faster on both layer types and is
 # the default. NANOCHAT_SOFTPLUS_IMPL picks between them:
 #
-#   fa4     (default) FA4's mainloop for everything
+#   hybrid  (default) FA4's forward always, Triton's backward on windowed layers
+#   fa4     FA4's mainloop for everything
 #   triton  the kernels in this file
 #   mixed   triton for windowed layers, fa4 for full-causal ones
 #
 # Measured on 1x GB10, B8 T2048 H12 D128, attention fwd+bwd, median of 5, against FA4
-# softmax at 5.736 ms (windowed) / 8.583 ms (full causal):
+# softmax at 5.725 ms (windowed) / 8.593 ms (full causal):
 #
-#                     windowed        full causal     SSSL mix
-#   triton            5.223 (1.098x)  9.360 (0.917x)  1.031x
-#   fa4               5.373 (1.068x)  8.231 (1.043x)  1.059x
-#   mixed             5.223           8.231           1.079x
+#                     windowed        full causal
+#   triton            5.209 (1.099x)  9.428 (0.911x)
+#   fa4               5.338 (1.068x)  8.396 (1.023x)
+#   hybrid            4.981 (1.149x)  8.396 (1.023x)
 #
-# `mixed` is the fastest and also the most fragile -- it is one machine's crossover,
-# and it comes from FA4 accumulating dQ atomically into an fp32 buffer and converting it
-# in a second pass, a fixed cost that a short windowed backward feels more. `fa4` is the
-# default because it beats softmax on both layer types with one implementation.
+# FA4 has the faster forward everywhere and Triton the faster backward on windowed
+# layers, so taking one from each beats either alone. The reason is not the score map:
+# FA4 accumulates dQ atomically into a 96 MiB float32 buffer and converts it in a second
+# pass, and both passes run at the machine's memory roof (0.528 ms against a 0.529 ms
+# bare memset, 0.691 against 0.675 for a bare cast). That 1.22 ms is a fixed cost per
+# call, so a 3.2 ms windowed backward feels it far more than a 5.5 ms full-causal one.
+# Triton's backward keeps dQ in registers and pays recompute instead.
+#
+# End to end, d12/bs32, median of 5: hybrid 1266.6 ms against fa4's 1270.5, and the two
+# distributions do not overlap (worst hybrid 1268.3 < best fa4 1268.6).
 # =============================================================================
 
-_SOFTPLUS_IMPL = os.environ.get("NANOCHAT_SOFTPLUS_IMPL", "fa4")
+_SOFTPLUS_IMPL = os.environ.get("NANOCHAT_SOFTPLUS_IMPL", "hybrid")
 
 # Forward tile splitting for the fa4 backend during *training*. Off by default; see
 # softplus_attn_fa4_func. NANOCHAT_SOFTPLUS_SPLITS=4 turns it on for an A/B.
@@ -543,15 +550,20 @@ def softplus_impl_name(window_size=None):
     if _SOFTPLUS_IMPL == "mixed":
         return "triton" if (window_size is not None and window_size[0] is not None
                             and window_size[0] >= 0) else "fa4"
-    return "fa4" if _SOFTPLUS_IMPL == "fa4" else "triton"
+    return "fa4" if _SOFTPLUS_IMPL in ("fa4", "hybrid") else "triton"
 
 
 def softplus_attention(q, k, v, window_size=(-1, 0), alpha=1.0):
     """Training entry point. q, k, v are (B, T, H, D); causal only."""
     if softplus_impl_name(window_size) == "fa4":
+        # hybrid: FA4 has the faster forward everywhere, Triton the faster backward on
+        # windowed layers, because FA4's fp32 dQ accumulator is a fixed 1.22 ms and a
+        # windowed backward is short enough to feel it.
+        windowed = window_size is not None and window_size[0] is not None and window_size[0] >= 0
+        bwd_impl = 1 if (_SOFTPLUS_IMPL == "hybrid" and windowed) else 0
         return _FA4_FUNC(q, k, v, causal=True,
                          window_size=(_left_window(window_size, k.size(1)), 0), alpha=alpha,
-                         num_splits=_SOFTPLUS_SPLITS)
+                         num_splits=_SOFTPLUS_SPLITS, bwd_impl=bwd_impl)
     return softplus_attn_func(q, k, v, causal=True, window_size=window_size, alpha=alpha)
 
 

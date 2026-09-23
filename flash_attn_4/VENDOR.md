@@ -250,6 +250,52 @@ fp32 accumulators plus a conversion pass. At B1 T8192 H1 the balance is worth ha
 `auto_bwd_m_chunk` applies the same gate as the forward and returns None at any
 training shape. The training path therefore runs the backward unsplit.
 
+### What the backward actually spends its time on
+
+Profiling one `_flash_attn_bwd` call at B8 T2048 H12 W=512 (4.419 ms):
+
+| | | |
+|---|---|---|
+| the backward kernel | 3.171 ms | 71.8% |
+| dq_accum -> bf16 conversion | 0.691 ms | 15.6% |
+| zeroing dq_accum | 0.528 ms | 11.9% |
+
+**27.5% of a windowed backward is dQ accumulator bookkeeping**, not arithmetic. FA4
+accumulates dQ atomically into a float32 buffer -- 96 MiB at this shape -- which has to
+be zeroed first and cast back afterwards. Both of those are already at the machine's
+memory roof: 0.528 ms against a 0.529 ms bare `memset` of the same buffer, and 0.691
+against 0.675 for a bare `to(bfloat16)`. There is nothing to win by implementing them
+better; the buffer itself is the cost, and it is a *fixed* 1.22 ms per call, so a short
+windowed backward feels it much more than a long full-causal one.
+
+Two ways to remove it, both dead ends here:
+
+- **Let the first CTA to reach a query tile store instead of add**, which would make the
+  zeroing unnecessary. It races: the counter says who arrived first at the counter, not
+  whose data write lands first, so a store can still overwrite an earlier add. Making it
+  safe needs the writers ordered, and SM80/SM120's backward asserts `mdQ_semaphore is
+  None` -- the ordering machinery upstream has for deterministic mode does not exist on
+  this path. Building it means a grid-wide spin-wait, which costs more than 0.528 ms.
+- **Drop the accumulator and recompute** in a second, query-parallel dQ kernel, the way
+  the Triton backward does. That trades the fixed 1.22 ms for roughly 40% more GEMM work
+  (S and dP get recomputed), which is why Triton wins by 0.5 ms on a windowed layer and
+  loses by 0.5 ms without a window. A CuTe rewrite would land in the same place.
+
+What is left is to take each direction from whichever kernel is better at it, which is
+what `NANOCHAT_SOFTPLUS_IMPL=hybrid` (now the default) does: FA4's forward always, and
+Triton's backward on windowed layers only.
+
+| B8 T2048 H12 | windowed | full causal |
+|---|---|---|
+| FA4 softmax | 5.725 | 8.593 ms |
+| Triton softplus | 5.209 | 9.428 ms |
+| CuTe softplus (`fa4`) | 5.338 | 8.396 ms |
+| **`hybrid`** | **4.981** | **8.396 ms** |
+
+End to end, d12/bs32, median of five: 1266.6 ms against `fa4`'s 1270.5, and the two
+distributions do not overlap -- the worst hybrid run, 1268.3, beats the best `fa4` run,
+1268.6.
+
 ### The backward's score map is already within 2-4% of its floor
 
 Worth checking whether the same trick is owed to the backward, which is four fifths of
