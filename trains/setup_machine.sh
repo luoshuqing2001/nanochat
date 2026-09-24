@@ -34,9 +34,12 @@ if [ "${INSTALL:-0}" = "1" ]; then
     # Falling back to --user with PYTHONUSERBASE under the cache keeps the install out of
     # a possibly shared and possibly read-only site-packages.
     PKGS="tiktoken rustbpe wandb apache-tvm-ffi torch-c-dlpack-ext quack-kernels"
-    python -m pip install -q $PKGS \
-        || python -m pip install -q --user $PKGS \
-        || echo "pip failed; see 'python -m pip install $PKGS'"
+    # Not -q. quack-kernels can build from source and take minutes, and with pip silent
+    # there is no way to tell that from a hang.
+    echo "installing: $PKGS"
+    python -m pip install $PKGS \
+        || python -m pip install --user $PKGS \
+        || echo "pip failed; rerun by hand: python -m pip install $PKGS"
     cp -n "$REPO/trains/tokenizer/"* "$NANOCHAT_BASE_DIR/tokenizer/" 2>/dev/null || true
 fi
 
