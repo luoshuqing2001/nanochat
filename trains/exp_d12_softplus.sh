@@ -22,8 +22,9 @@
 # question about quality -- length extrapolation, attention entropy -- not throughput:
 # the kernel is 1.06x on attention, which is ~0.6% of a step.
 #
-# NANOCHAT_SOFTPLUS_IMPL picks the kernel (fa4 by default, or triton / mixed). It is
-# cleared by _exp_common.sh, so set it here if an arm needs a specific one.
+# NANOCHAT_SOFTPLUS_IMPL picks the kernel (hybrid by default; fixed / fixed_triton
+# force fixed KV/query tasks). This and the KV_CHUNK/Q_CHUNK/SPLITS overrides are
+# cleared by _exp_common.sh; set them after sourcing it for a controlled experiment.
 # =============================================================================
 set -euo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
