@@ -40,6 +40,9 @@ trains/softplus_*.csv
 trains/softplus_*.log
 trains/*.metadata.json
 
+# Caches redirected here by trains/setup_machine.sh when $HOME is not writable
+.cache/
+
 # Local tooling / build cruft
 .claude/settings.local.json
 .ipynb_checkpoints/
