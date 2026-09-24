@@ -37,8 +37,10 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
-    # Attention score map: "softmax" (normalised, FA3/FA4/SDPA) or "softplus"
-    # (elementwise, unnormalised, scaled by n^-softplus_alpha; see softplus_attention.py)
+    # Attention score map: "softmax" (normalised, FA3/FA4/SDPA), "softplus"
+    # (elementwise, unnormalised, scaled by n^-softplus_alpha; see softplus_attention.py) or
+    # "softplus_rmsnorm" (unnormalised softplus, then a per-head output RMSNorm with a learned
+    # gain folded into c_proj; see softplus_rmsnorm_attention.py)
     attn_kind: str = "softmax"
     softplus_alpha: float = 1.0
 
@@ -84,6 +86,8 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.attn_kind = config.attn_kind
         self.softplus_alpha = config.softplus_alpha
+        # softplus_rmsnorm: per-head RMSNorm gain on the attention output, (n_head * head_dim,)
+        self.attn_gamma = nn.Parameter(torch.ones(self.n_embd)) if self.attn_kind == "softplus_rmsnorm" else None
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
@@ -111,7 +115,20 @@ class CausalSelfAttention(nn.Module):
 
         # Flash Attention (FA3 or SDPA fallback)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if self.attn_kind == "softplus":
+        if self.attn_kind == "softplus_rmsnorm":
+            # Output is RMS-normalised per head; the gain is applied through c_proj below
+            from nanochat.softplus_rmsnorm_attention import (
+                softplus_rmsnorm_attn_func, softplus_rmsnorm_attn_with_kvcache)
+            if kv_cache is None:
+                y = softplus_rmsnorm_attn_func(q, k, v, window_size=window_size)
+            else:
+                k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+                y = softplus_rmsnorm_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v,
+                                                       cache_seqlens=kv_cache.cache_seqlens,
+                                                       window_size=window_size)
+                if self.layer_idx == kv_cache.n_layers - 1:
+                    kv_cache.advance(T)
+        elif self.attn_kind == "softplus":
             # Backend (FA4's mainloop or the standalone Triton kernels) is chosen inside
             # softplus_attention; NANOCHAT_SOFTPLUS_IMPL overrides it.
             from nanochat.softplus_attention import softplus_attention, softplus_attn_with_kvcache
@@ -144,7 +161,15 @@ class CausalSelfAttention(nn.Module):
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
-        y = self.c_proj(y)
+        if self.attn_gamma is not None and type(self.c_proj) is Linear:
+            # RMSNorm gain folded into the projection: c_proj(gamma * y) = y @ (W diag(gamma))^T
+            y = F.linear(y, (self.c_proj.weight * self.attn_gamma).to(dtype=y.dtype))
+        elif self.attn_gamma is not None:
+            # c_proj was swapped (Float8Linear under --fp8): keep its forward; under torch.compile
+            # the scale fuses into its input cast
+            y = self.c_proj(y * self.attn_gamma.to(dtype=y.dtype))
+        else:
+            y = self.c_proj(y)
         return y
 
 
@@ -275,6 +300,11 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+
+        # softplus_rmsnorm output RMSNorm gains start at identity
+        for block in self.transformer.h:
+            if block.attn.attn_gamma is not None:
+                torch.nn.init.ones_(block.attn.attn_gamma)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -448,14 +478,16 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # softplus_rmsnorm gains are vectors: AdamW, not Muon
+        attn_gamma_params = [b.attn.attn_gamma for b in self.transformer.h if b.attn.attn_gamma is not None]
+        matrix_params = [p for p in self.transformer.h.parameters() if all(p is not g for g in attn_gamma_params)]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(attn_gamma_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -471,6 +503,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if attn_gamma_params:
+            # same lr/betas as the other per-channel scalars (resid_lambdas), no weight decay
+            param_groups.append(dict(kind='adamw', params=attn_gamma_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]

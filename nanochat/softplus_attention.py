@@ -35,38 +35,37 @@ import os
 import torch
 import triton
 import triton.language as tl
+from nanochat.softplus_math import softplus_pair
 
 
 @triton.jit
 def _softplus(x):
-    """softplus(s) = max(s, 0) + log(1 + exp(-|s|)), evaluated in base 2.
-
-    The max/|s| form keeps the exponent non-positive, so the exponential cannot overflow
-    for any input, with no branch or clamp on magnitude. Writing it with exp2/log2 maps
-    onto the hardware's ex2/lg2 instructions directly; exp/log lower to the same
-    instructions plus a multiply each.
-
-    Note softplus costs two transcendentals per score against softmax's one exp, which is
-    a structural cost of the score map, not of this implementation."""
-    # constants inlined: a @triton.jit body cannot capture module-level floats
-    return tl.maximum(x, 0.0) + tl.log2(1.0 + tl.exp2(-tl.abs(x) * 1.4426950408889634)) * 0.6931471805599453
+    sp, _ = softplus_pair(x)
+    return sp
 
 
 @triton.jit
-def _row_scale(offs_m, alpha, WINDOW: tl.constexpr):
+def _row_scale(offs_m, alpha: tl.constexpr, WINDOW: tl.constexpr):
     """c_i = n_i^-alpha with n_i = min(i+1, WINDOW+1). Index arithmetic, no reduction --
     this is what replaces softmax's row sum, and why no tile ever needs the others."""
     n = offs_m + 1
     if WINDOW >= 0:
         n = tl.minimum(n, WINDOW + 1)
-    return tl.exp(-alpha * tl.log(n.to(tl.float32)))[:, None]
+    n = tl.maximum(n,1).to(tl.float32)
+    if alpha == 1.:
+        c = 1. / n
+    elif alpha == 0.:
+        c = tl.full(n.shape,1.,tl.float32)
+    else:
+        c = tl.exp2(-alpha * tl.log2(n))
+    return c[:,None]
 
 
 @triton.jit
 def _fwd_kernel(
     Q, K, V, O,
     sqb, sqt, sqh, skb, skt, skh, svb, svt, svh, sob, sot, soh,
-    T, scale, alpha,
+    T, scale, alpha: tl.constexpr,
     REVERSE: tl.constexpr, WINDOW: tl.constexpr, HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
@@ -129,8 +128,8 @@ def _fwd_kernel(
 def _bwd_kv_kernel(
     Q, K, V, DO, DK, DV,
     sqb, sqt, sqh, skb, skt, skh, svb, svt, svh, sdob, sdot, sdoh,
-    T, scale, alpha,
-    REVERSE: tl.constexpr, WINDOW: tl.constexpr, HEAD_DIM: tl.constexpr,
+    T, scale, alpha: tl.constexpr,
+    H: tl.constexpr, REVERSE: tl.constexpr, WINDOW: tl.constexpr, HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     """One program per key tile: dK_j = scale * sum_i dS_ij q_i, dV_j = sum_i c_i P_ij dO_i."""
@@ -167,10 +166,7 @@ def _bwd_kv_kernel(
             keep = keep & ((offs_m[:, None] - offs_n[None, :]) <= WINDOW)
         c = _row_scale(offs_m, alpha, WINDOW)
 
-        sp = _softplus(s)
-        # sigmoid(s) = 1 - exp(-softplus(s)): reuses the softplus already computed instead
-        # of a second transcendental pair. Exact, and sp >= 0 keeps the exponent negative.
-        sig = 1.0 - tl.exp(-sp)
+        sp, sig = softplus_pair(s)
 
         p = tl.where(keep, sp, 0.0) * c
         dv += tl.dot(tl.trans(p).to(do.dtype), do)
@@ -178,9 +174,9 @@ def _bwd_kv_kernel(
         ds = tl.where(keep, dp * sig, 0.0)
         dk += tl.dot(tl.trans(ds).to(q.dtype), q) * scale
 
-    tl.store(DK + off_b * skb + off_h * skh + offs_n[:, None] * skt + offs_d[None, :],
+    tl.store(DK + ((off_b * T + offs_n[:,None]) * H + off_h) * HEAD_DIM + offs_d[None,:],
              dk.to(DK.dtype.element_ty), mask=kmask)
-    tl.store(DV + off_b * svb + off_h * svh + offs_n[:, None] * svt + offs_d[None, :],
+    tl.store(DV + ((off_b * T + offs_n[:,None]) * H + off_h) * HEAD_DIM + offs_d[None,:],
              dv.to(DV.dtype.element_ty), mask=kmask)
 
 
@@ -188,8 +184,8 @@ def _bwd_kv_kernel(
 def _bwd_q_kernel(
     Q, K, V, DO, DQ,
     sqb, sqt, sqh, skb, skt, skh, svb, svt, svh, sdob, sdot, sdoh,
-    T, scale, alpha,
-    REVERSE: tl.constexpr, WINDOW: tl.constexpr, HEAD_DIM: tl.constexpr,
+    T, scale, alpha: tl.constexpr,
+    H: tl.constexpr, REVERSE: tl.constexpr, WINDOW: tl.constexpr, HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     """One program per query tile: dQ_i = scale * sum_j dS_ij k_j."""
@@ -208,8 +204,8 @@ def _bwd_q_kernel(
     dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     c = _row_scale(offs_m, alpha, WINDOW)
 
-    diag = pid_m * BLOCK_M
-    hi = tl.minimum(diag + BLOCK_M, T)
+    diag = (pid_m * BLOCK_M // BLOCK_N) * BLOCK_N
+    hi = tl.minimum((pid_m + 1) * BLOCK_M, T)
     lo = 0
     if WINDOW >= 0:
         lo = tl.maximum(0, diag - WINDOW)
@@ -239,7 +235,7 @@ def _bwd_q_kernel(
         ds = tl.where(keep, tl.dot(do, tl.trans(v)) * c * tl.sigmoid(s), 0.0)
         dq += tl.dot(ds.to(k.dtype), k) * scale
 
-    tl.store(DQ + off_b * sqb + off_h * sqh + offs_m[:, None] * sqt + offs_d[None, :],
+    tl.store(DQ + ((off_b * T + offs_m[:,None]) * H + off_h) * HEAD_DIM + offs_d[None,:],
              dq.to(DQ.dtype.element_ty), mask=offs_m[:, None] < T)
 
 
@@ -387,7 +383,7 @@ def _bwd(q, k, v, do, window, alpha, scale, BLOCK_M=64, BLOCK_N=64):
     B4 T1024 H8 D128 window 255 on a GB10), because causal masking makes every later
     query tile contend for the same dK/dV tile."""
     B, T, H, D = q.shape
-    dq, dk, dv = (torch.empty_like(x) for x in (q, k, v))
+    dq, dk, dv = (torch.empty(x.shape,device=x.device,dtype=x.dtype) for x in (q,k,v))
     args = (q.stride(0), q.stride(1), q.stride(2),
             k.stride(0), k.stride(1), k.stride(2),
             v.stride(0), v.stride(1), v.stride(2),
@@ -396,7 +392,7 @@ def _bwd(q, k, v, do, window, alpha, scale, BLOCK_M=64, BLOCK_N=64):
     # 64x64 with 8 warps measured best for both window regimes; the larger query tiles
     # that help the forward do not compile here (shared memory holds q, k, v, do and two
     # accumulators at once).
-    kw = dict(WINDOW=window, HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+    kw = dict(H=H, WINDOW=window, HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
               num_warps=8, num_stages=2)
     # dK/dV work shrinks with the key index -- key tile 0 is read by every query tile --
     # so that kernel is already longest-first. dQ grows like the forward.
@@ -418,21 +414,9 @@ class _SoftplusAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v = ctx.saved_tensors
-        B, T, H, D = q.shape
-        do = do.contiguous()
-        dq, dk, dv = (torch.empty_like(x) for x in (q, k, v))
-        BLOCK_M = BLOCK_N = 64
-        args = (q.stride(0), q.stride(1), q.stride(2),
-                k.stride(0), k.stride(1), k.stride(2),
-                v.stride(0), v.stride(1), v.stride(2),
-                do.stride(0), do.stride(1), do.stride(2),
-                T, ctx.scale, ctx.alpha)
-        kw = dict(WINDOW=ctx.window, HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-                  num_warps=8, num_stages=2)
-        _bwd_kv_kernel[(triton.cdiv(T, BLOCK_N), B, H)](q, k, v, do, dk, dv, *args, **kw)
-        _bwd_q_kernel[(triton.cdiv(T, BLOCK_M), B, H)](q, k, v, do, dq, *args, **kw)
-        return dq, dk, dv, None, None, None
+        q,k,v = ctx.saved_tensors
+        dq,dk,dv = _bwd(q,k,v,do.contiguous(),ctx.window,ctx.alpha,ctx.scale)
+        return dq,dk,dv,None,None,None
 
 
 # torch.library wrappers, for the same reason FA4 needs them: called directly from a
@@ -457,7 +441,7 @@ def _op_bwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, do: torch.Tensor,
 
 @_op_bwd.register_fake
 def _(q, k, v, do, window, alpha, scale):
-    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    return tuple(torch.empty(x.shape, device=x.device, dtype=x.dtype) for x in (q, k, v))
 
 
 def _setup_context(ctx, inputs, output):
@@ -491,36 +475,28 @@ def softplus_attn_func(q, k, v, causal=True, window_size=(-1, 0), alpha=1.0, sof
 # is a second one that runs FA4's own mainloop; it is faster on both layer types and is
 # the default. NANOCHAT_SOFTPLUS_IMPL picks between them:
 #
-#   hybrid  (default) FA4's forward always, Triton's backward on windowed layers
+#   hybrid  (default) FA4 forward; Triton backward for large D128 windowed workloads
 #   fa4     FA4's mainloop for everything
 #   triton  the kernels in this file
 #   mixed   triton for windowed layers, fa4 for full-causal ones
+#   fixed   fixed KV/query chunks in CuTe forward/backward, explicitly enabled
+#   fixed_triton  fixed KV/query chunks with compact FP32 accumulators in Triton
 #
-# Measured on 1x GB10, B8 T2048 H12 D128, attention fwd+bwd, median of 5, against FA4
-# softmax at 5.725 ms (windowed) / 8.593 ms (full causal):
-#
-#                     windowed        full causal
-#   triton            5.209 (1.099x)  9.428 (0.911x)
-#   fa4               5.338 (1.068x)  8.396 (1.023x)
-#   hybrid            4.981 (1.149x)  8.396 (1.023x)
-#
-# FA4 has the faster forward everywhere and Triton the faster backward on windowed
-# layers, so taking one from each beats either alone. The reason is not the score map:
-# FA4 accumulates dQ atomically into a 96 MiB float32 buffer and converts it in a second
-# pass, and both passes run at the machine's memory roof (0.528 ms against a 0.529 ms
-# bare memset, 0.691 against 0.675 for a bare cast). That 1.22 ms is a fixed cost per
-# call, so a 3.2 ms windowed backward feels it far more than a 5.5 ms full-causal one.
-# Triton's backward keeps dQ in registers and pays recompute instead.
-#
-# End to end, d12/bs32, median of 5: hybrid 1266.6 ms against fa4's 1270.5, and the two
-# distributions do not overlap (worst hybrid 1268.3 < best fa4 1268.6).
+# General SM120 tuning and current measurements: trains/SOFTPLUS_GENERAL.md.
+# The CuTe pipelined backward wins for most workloads; high head parallelism with
+# D128 local attention can favor Triton's separate dQ kernel, which avoids an FP32
+# atomic dQ workspace at the cost of recomputing scores.
 # =============================================================================
 
 _SOFTPLUS_IMPL = os.environ.get("NANOCHAT_SOFTPLUS_IMPL", "hybrid")
 
-# Forward tile splitting for the fa4 backend during *training*. Off by default; see
-# softplus_attn_fa4_func. NANOCHAT_SOFTPLUS_SPLITS=4 turns it on for an A/B.
-_SOFTPLUS_SPLITS = int(os.environ.get("NANOCHAT_SOFTPLUS_SPLITS", "1"))
+# Auto selects fixed-length KV tasks at measured training shapes. Integer
+# overrides retain the legacy fixed split count (1 disables forward splitting).
+_SOFTPLUS_SPLITS = os.environ.get("NANOCHAT_SOFTPLUS_SPLITS", "auto")
+if _SOFTPLUS_SPLITS != "auto":
+    _SOFTPLUS_SPLITS = int(_SOFTPLUS_SPLITS)
+_SOFTPLUS_KV_CHUNK = int(os.environ.get("NANOCHAT_SOFTPLUS_KV_CHUNK", "1024"))
+_SOFTPLUS_Q_CHUNK = int(os.environ.get("NANOCHAT_SOFTPLUS_Q_CHUNK", "1024"))
 
 
 def _load_fa4_softplus():
@@ -544,7 +520,9 @@ def _left_window(window_size, seqlen_k):
 
 
 def softplus_impl_name(window_size=None):
-    """Which backend a layer with this window actually runs on: 'fa4' | 'triton'."""
+    """Configured backend family; its automatic forward can choose a tuned kernel."""
+    if _SOFTPLUS_IMPL in ("fixed", "fixed_triton"):
+        return _SOFTPLUS_IMPL
     if not HAS_FA4_SOFTPLUS:
         return "triton"
     if _SOFTPLUS_IMPL == "mixed":
@@ -555,14 +533,31 @@ def softplus_impl_name(window_size=None):
 
 def softplus_attention(q, k, v, window_size=(-1, 0), alpha=1.0):
     """Training entry point. q, k, v are (B, T, H, D); causal only."""
+    if _SOFTPLUS_IMPL == "fixed_triton":
+        from nanochat.softplus_fixed_kv import fixed_kv_attention
+        left = _left_window(window_size, k.size(1))
+        return fixed_kv_attention(q, k, v, -1 if left is None else left, alpha,
+                                  kv_chunk=_SOFTPLUS_KV_CHUNK, q_chunk=_SOFTPLUS_Q_CHUNK)
+    if _SOFTPLUS_IMPL == "fixed":
+        from flash_attn_4.softplus_api import kv_chunk_blocks
+        if not HAS_FA4_SOFTPLUS:
+            raise RuntimeError("fixed backend requires the CuTe softplus implementation")
+        if _SOFTPLUS_Q_CHUNK <= 0 or _SOFTPLUS_Q_CHUNK % 64:
+            raise ValueError("query chunk must be a positive multiple of 64 tokens")
+        return _FA4_FUNC(q, k, v, window_size=(_left_window(window_size, k.size(1)), 0),
+                         alpha=alpha, balanced_chunk=kv_chunk_blocks(q, _SOFTPLUS_KV_CHUNK),
+                         bwd_m_chunk=max(1, (_SOFTPLUS_Q_CHUNK + 63) // 64), bwd_impl=0)
     if softplus_impl_name(window_size) == "fa4":
-        # hybrid: FA4 has the faster forward everywhere, Triton the faster backward on
-        # windowed layers, because FA4's fp32 dQ accumulator is a fixed 1.22 ms and a
-        # windowed backward is short enough to feel it.
-        windowed = window_size is not None and window_size[0] is not None and window_size[0] >= 0
-        bwd_impl = 1 if (_SOFTPLUS_IMPL == "hybrid" and windowed) else 0
+        # Select backward by visible work and head parallelism.
+        left = _left_window(window_size, k.size(1))
+        # The pipelined CuTe kernel wins at low/moderate head parallelism and D64.
+        # At large D128 windowed shapes, avoiding the full FP32 dQ workspace wins.
+        sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+        bwd_impl = int(_SOFTPLUS_IMPL == "hybrid" and left is not None
+                       and q.shape[1] == k.shape[1] == v.shape[1]
+                       and q.shape[-1] > 64 and q.shape[0]*q.shape[2] >= 2*sms)
         return _FA4_FUNC(q, k, v, causal=True,
-                         window_size=(_left_window(window_size, k.size(1)), 0), alpha=alpha,
+                         window_size=(left, 0), alpha=alpha,
                          num_splits=_SOFTPLUS_SPLITS, bwd_impl=bwd_impl)
     return softplus_attn_func(q, k, v, causal=True, window_size=window_size, alpha=alpha)
 
@@ -571,11 +566,10 @@ def softplus_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlen
                                causal=True, window_size=(-1, 0), alpha=1.0, softmax_scale=None):
     """Inference path.
 
-    Uses FA4's softplus kernel with tile splitting when it is available. Decode is what
-    splitting exists for: one query token against a long cache is a handful of programs
-    on 48 SMs, and cutting the key range is the only parallelism left. `num_splits="auto"`
-    sizes it from the shape -- 6.0x against a 4k cache, 2.8x against 64k, and 1 whenever
-    the machine is already full.
+    The automatic forward dispatch uses fixed-size KV tasks for single-query D64/D128
+    decode, with FP32 atomic aggregation, and tuned tiled kernels for prefill. Each decode task reduces
+    a KV chunk without padding Q to an MMA tile or building a host scheduling table.
+    A short cache/window fitting one task writes the output directly without atomics.
 
     The fallback materialises the Tq x context score matrix in float32, which is fine for
     a single decode step and quadratic for a long prefill.
@@ -587,6 +581,15 @@ def softplus_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlen
         v_cache[:, pos:pos + Tq] = v
     end = pos + Tq
     ks, vs = k_cache[:, :end], v_cache[:, :end]
+    if _SOFTPLUS_IMPL == "fixed_triton" and Tq > 1:
+        from nanochat.softplus_fixed_kv import fixed_kv_forward
+        left = _left_window(window_size, end)
+        return fixed_kv_forward(q, ks, vs, -1 if left is None else left, alpha, softmax_scale,
+                                chunk=_SOFTPLUS_KV_CHUNK, bm=128)
+    if _SOFTPLUS_IMPL == "fixed" and Tq > 1:
+        from flash_attn_4.softplus_api import kv_chunk_blocks
+        return _FA4_FWD(q, ks, vs, True, (_left_window(window_size, end), 0), alpha, softmax_scale,
+                        balanced_chunk=kv_chunk_blocks(q, _SOFTPLUS_KV_CHUNK))
     if HAS_FA4_SOFTPLUS and _SOFTPLUS_IMPL != "materialize":
         return _FA4_FWD(q, ks, vs, True, (_left_window(window_size, end), 0),
                         alpha, softmax_scale, num_splits="auto")
@@ -610,7 +613,7 @@ def softplus_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlen
 def _bwd_fused_kernel(
     Q, K, V, DO, DQ, DK, DV,
     sqb, sqt, sqh, skb, skt, skh, svb, svt, svh, sdob, sdot, sdoh,
-    T, scale, alpha,
+    T, scale, alpha: tl.constexpr,
     WINDOW: tl.constexpr, HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):

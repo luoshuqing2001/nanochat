@@ -590,6 +590,21 @@ def _flash_attn_fwd(
     softplus_alpha: float = 1.0,
     softplus_num_splits: int = 1,
     softplus_balanced_chunk: Optional[int] = None,
+    softplus_fragment_n: int = 0,
+    softplus_q_in_regs: bool = False,
+    softplus_stream_workers: int = 0,
+    softplus_stream_tail: bool = False,
+    softplus_stream_atomic: bool = False,
+    softplus_stream_tiles: bool = False,
+    softplus_stream_global: bool = False,
+    softplus_stream_complete: bool = False,
+    softplus_kv_split_size: int = 0,
+    softplus_kv_major: bool = False,
+    sm120_global_lpt: bool = False,
+    sm120_owner_pair: bool = False,
+    sm120_head_lpt: bool = False,
+    softplus_warp_overlap: bool = False,
+    softplus_poly_estrin: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -605,6 +620,54 @@ def _flash_attn_fwd(
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
     """
+    if not isinstance(softplus_stream_workers, int) or softplus_stream_workers < 0:
+        raise ValueError("softplus_stream_workers must be a nonnegative integer")
+    if softplus_stream_tail and not softplus_stream_workers:
+        raise ValueError("softplus_stream_tail requires stream workers")
+    if softplus_stream_tiles and (not softplus_stream_workers or softplus_stream_tail):
+        raise ValueError("stream tiles requires workers and is incompatible with tail")
+    if softplus_stream_atomic and not softplus_stream_workers:
+        raise ValueError("stream atomic requires stream workers")
+    if softplus_stream_global and (not softplus_stream_tiles or not softplus_stream_workers):
+        raise ValueError("global stream requires tiles and workers")
+    if softplus_stream_complete and (not softplus_stream_workers or softplus_stream_atomic):
+        raise ValueError("completion requires private stream partials")
+    if softplus_kv_major and not softplus_kv_split_size:
+        raise ValueError("KV-major order requires a positive KV cap")
+    if softplus_kv_split_size and (not softplus_stream_workers or not softplus_stream_tiles or softplus_stream_tail):
+        raise ValueError("KV cap requires stream workers, tiles, and no tail")
+    stream_table = stream_groups = stream_partial = None
+    stream_slots = stream_grid = 0
+    if softplus_stream_workers:
+        if (attn_kind != "softplus" or aux_tensors is not None or out is not None
+                or q is None or q.ndim != 4 or k.shape != v.shape
+                or q.shape[0] != k.shape[0] or q.shape[2:] != k.shape[2:]
+                or q.shape[-1] not in (64,128) or not 0 < q.shape[1] <= k.shape[1]
+                or softplus_num_splits != 1 or softplus_balanced_chunk is not None
+                or num_splits != 1 or not (causal or window_size_right == 0)
+                or window_size_right not in (None, 0)
+                or any(x is not None for x in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k,
+                       page_table, gather_kv_indices, score_mod, mask_mod, block_sparse_tensors, learnable_sink))):
+            raise ValueError("CuTe Stream-K requires dense causal equal-head D64/128 unsplit Softplus")
+        tile_mn = tile_mn or (64,128 if q.shape[-1] == 64 else 64)
+        from flash_attn_4.softplus_stream import build_stream_plan
+        stream_table,stream_groups,stream_slots,stream_grid=build_stream_plan(
+            q.shape[1],k.shape[1],-1 if window_size_left is None else window_size_left,
+            *tile_mn,softplus_stream_workers,softplus_stream_tail,str(q.device),softplus_stream_atomic,softplus_stream_tiles,softplus_stream_global,q.shape[0]*q.shape[2],softplus_kv_split_size,softplus_kv_major)
+        stream_partial=torch.empty((q.shape[0]*q.shape[2],max(1,stream_slots),tile_mn[0],v.shape[-1]),
+                                   device=q.device,dtype=torch.float32)
+        if softplus_stream_atomic and stream_slots:
+            stream_partial.zero_()
+        aux_tensors=[stream_partial]
+        if softplus_stream_complete:
+            from flash_attn_4.softplus_stream import completion_metadata
+            stream_meta,ngroups=completion_metadata(q.shape[1],k.shape[1],
+                -1 if window_size_left is None else window_size_left,*tile_mn,
+                softplus_stream_workers,softplus_stream_tail,softplus_stream_tiles,
+                softplus_stream_global,q.shape[0]*q.shape[2],str(q.device),softplus_kv_split_size,softplus_kv_major)
+            # Per invocation, never cached: safe for concurrent streams and graph replay.
+            counters=(torch.zeros if ngroups else torch.empty)((q.shape[0]*q.shape[2],max(1,ngroups)),device=q.device,dtype=torch.int32)
+            aux_tensors += [counters,stream_meta]
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     requires_grad = any(
         t is not None and t.requires_grad for t in (q, k, v, qv, learnable_sink)
@@ -709,6 +772,27 @@ def _flash_attn_fwd(
             )
         ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
+    if int(sm120_owner_pair)+int(sm120_global_lpt)+int(sm120_head_lpt)>1:
+        raise ValueError("owner pairing and global LPT are separate schedules")
+    if (sm120_global_lpt or sm120_owner_pair or sm120_head_lpt) and (arch//10!=12 or not causal or window_size_left is not None
+            or softplus_stream_workers or softplus_balanced_chunk is not None or softplus_num_splits!=1
+            or num_splits!=1 or q.shape[2]!=k.shape[2] or qv is not None
+            or any(x is not None for x in (cu_seqlens_q,cu_seqlens_k,seqused_q,seqused_k,page_table))):
+        raise ValueError("global LPT control requires SM120 dense causal unsplit equal-head inputs")
+    if softplus_fragment_n or softplus_q_in_regs or softplus_stream_workers or softplus_warp_overlap or softplus_poly_estrin:
+        if (attn_kind != "softplus" or arch // 10 not in (8, 12)
+                or cu_seqlens_q is not None or cu_seqlens_k is not None
+                or seqused_q is not None or seqused_k is not None
+                or page_table is not None or gather_kv_indices is not None
+                or score_mod is not None or mask_mod is not None
+                or block_sparse_tensors is not None or learnable_sink is not None
+                or num_head != num_head_kv or head_dim != head_dim_v
+                or seqlen_q > seqlen_k or window_size_right not in (None, 0)
+                or (window_size_left is not None and not causal and window_size_right != 0)
+                or softplus_num_splits != 1 or softplus_balanced_chunk is not None):
+            raise ValueError("Softplus fragment/Q-register experiments require dense SM80/SM120 equal-head unsplit attention without custom masks")
+        if softplus_fragment_n not in (0, 32, 64):
+            raise ValueError("softplus_fragment_n must be 0, 32, or 64")
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // v.element_size()
@@ -1238,6 +1322,18 @@ def _flash_attn_fwd(
         window_size_left if attn_kind == "softplus" else None,
         softplus_num_splits,
         softplus_balanced_chunk,
+        softplus_fragment_n,
+        softplus_q_in_regs,
+        stream_grid,
+        softplus_stream_atomic,
+        softplus_stream_tiles,
+        softplus_stream_global,
+        softplus_stream_complete,
+        sm120_global_lpt,
+        sm120_owner_pair,
+        sm120_head_lpt,
+        softplus_warp_overlap,
+        softplus_poly_estrin,
         # The atomic paths can accumulate in fp32 or in the output dtype, which changes
         # the kernel's mO type and so has to be part of the key.
         out.dtype if attn_kind == "softplus" else None,
@@ -1247,7 +1343,7 @@ def _flash_attn_fwd(
     # CTA for a single (batch, head) -- a few dozen at training shapes -- shared by the
     # whole grid. Rebuilt per call because it depends on the sequence lengths, but it is
     # a handful of integers.
-    work_table = None
+    work_table = stream_table
     if softplus_balanced_chunk is not None:
         assert attn_kind == "softplus", "balanced scheduling is softplus-only"
         assert not is_varlen, "balanced scheduling does not support varlen yet"
@@ -1349,6 +1445,14 @@ def _flash_attn_fwd(
                     window_size_right=window_size_right if local else None,
                     num_splits=softplus_num_splits,
                     balanced_chunk=softplus_balanced_chunk,
+                    fragment_n=softplus_fragment_n,
+                    poly_estrin=softplus_poly_estrin,
+                    stream_workers=stream_grid,
+                    stream_atomic=softplus_stream_atomic,
+                    stream_tiles=softplus_stream_tiles,
+                    stream_global=softplus_stream_global,
+                    stream_complete=softplus_stream_complete,
+                    warp_overlap=softplus_warp_overlap,
                 )
             fa_fwd = fwd_cls(
                 dtype,
@@ -1362,7 +1466,7 @@ def _flash_attn_fwd(
                 tile_n=tile_n,
                 num_stages=1,
                 num_threads=num_threads,
-                Q_in_regs=False,
+                Q_in_regs=softplus_q_in_regs if attn_kind == "softplus" else False,
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
@@ -1474,6 +1578,14 @@ def _flash_attn_fwd(
                     window_size_right=window_size_right if local else None,
                     num_splits=softplus_num_splits,
                     balanced_chunk=softplus_balanced_chunk,
+                    fragment_n=softplus_fragment_n,
+                    poly_estrin=softplus_poly_estrin,
+                    stream_workers=stream_grid,
+                    stream_atomic=softplus_stream_atomic,
+                    stream_tiles=softplus_stream_tiles,
+                    stream_global=softplus_stream_global,
+                    stream_complete=softplus_stream_complete,
+                    warp_overlap=softplus_warp_overlap,
                 )
             fa_fwd = fwd_cls(
                 dtype,
@@ -1487,7 +1599,7 @@ def _flash_attn_fwd(
                 tile_n=tile_n,
                 num_stages=1,
                 num_threads=num_threads,
-                Q_in_regs=False,
+                Q_in_regs=softplus_q_in_regs if attn_kind == "softplus" else False,
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
@@ -1497,6 +1609,16 @@ def _flash_attn_fwd(
             raise ValueError(
                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
             )
+        if sm120_global_lpt:
+            from flash_attn_4.global_query_scheduler import GlobalQueryScheduler
+            fa_fwd.tile_scheduler_cls=GlobalQueryScheduler
+        if sm120_head_lpt:
+            from flash_attn_4.global_query_scheduler import HeadLocalQueryScheduler
+            fa_fwd.tile_scheduler_cls=HeadLocalQueryScheduler
+        if sm120_owner_pair:
+            from flash_attn_4.global_query_scheduler import PairedQueryScheduler
+            fa_fwd.tile_scheduler_cls=PairedQueryScheduler
+            fa_fwd.owner_pair=True
         # TODO: check @can_implement
         if qv is not None:
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
@@ -1684,6 +1806,12 @@ def _flash_attn_fwd(
         # is_split_kv (using CTA 0, since a later CTA may have exited prematurely), so
         # that this host-side zeroing is only needed when is_split_kv=False.
         tile_count_semaphore.zero_()
+    if softplus_stream_workers and stream_slots and not softplus_stream_complete and not fake_mode:
+        from nanochat.softplus_stream_k import _finish
+        import triton
+        _finish[(stream_groups.shape[0],triton.cdiv(tile_mn[0]*head_dim_v,256),batch_size*num_head)](
+            stream_partial,out,stream_groups,seqlen_q,seqlen_k,num_head,head_dim_v,
+            -1 if window_size_left is None else window_size_left,softplus_alpha,tile_mn[0],stream_slots,256)
     return out, lse, p, row_max
 
 
@@ -2010,10 +2138,47 @@ def _flash_attn_bwd(
     softplus_balanced_m_chunk: Optional[int] = None,
     dlse: Optional[torch.Tensor] = None,
     learnable_sink: Optional[torch.Tensor] = None,
+    sm120_bwd_tile: Optional[Tuple[int, int, int, int]] = None,
+    sm120_owner_pair: bool = False,
+    softplus_early_dv: bool = False,
+    softplus_native_bwd: bool = False,
+    softplus_inline_scale: bool = False,
+    softplus_share_pd: bool = False,
+    softplus_poly_estrin: bool = False,
+    sm120_bwd_num_threads: int = 128,
+    sm120_bwd_warp_layout: Optional[Tuple[int, int, int]] = None,
+    softplus_bwd_component: Optional[str] = None,
 ) -> Tuple[torch.Tensor, ...]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
     arch = _get_device_arch()
+    if softplus_bwd_component is not None:
+        if (softplus_bwd_component not in ("qk","v") or attn_kind != "softplus" or arch // 10 != 12
+                or q.shape[2] != k.shape[2] or k.shape[2] != v.shape[2]
+                or cu_seqlens_q is not None or cu_seqlens_k is not None
+                or softplus_native_bwd or softplus_inline_scale or softplus_share_pd
+                or softplus_balanced_m_chunk is not None or sm120_owner_pair):
+            raise ValueError("split components require dense SM120 Softplus MHA with unsplit KV owners")
+        if softplus_bwd_component == "v" and sm120_bwd_tile != (64,64,1,1):
+            raise ValueError("dV component requires tile (64,64,1,1)")
+        softplus_early_dv = True
+    if sm120_bwd_num_threads != 128 and arch // 10 != 12:
+        raise ValueError("sm120_bwd_num_threads requires SM120")
+    if sm120_bwd_warp_layout is not None and arch // 10 != 12:
+        raise ValueError("sm120_bwd_warp_layout requires SM120")
+    if softplus_poly_estrin and (attn_kind != "softplus" or arch // 10 != 12):
+        raise ValueError("Estrin backward requires SM120 Softplus")
+    if softplus_native_bwd and softplus_inline_scale:
+        raise ValueError("scaled-dO and inline scaling are alternatives")
+    if softplus_native_bwd or softplus_share_pd or softplus_inline_scale:
+        if (attn_kind != "softplus" or arch // 10 != 12 or cu_seqlens_q is not None
+                or cu_seqlens_k is not None or score_mod is not None or score_mod_bwd is not None
+                or mask_mod is not None or block_sparse_tensors is not None or V_in_regs
+                or seqused_q is not None or seqused_k is not None or learnable_sink is not None):
+            raise ValueError("native/shared-PdS backward requires dense SM120 Softplus")
+        softplus_early_dv = True
+    if softplus_early_dv and (attn_kind != "softplus" or arch // 10 != 12):
+        raise ValueError("early-dV is implemented for the SM120 Softplus backward")
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
     if block_sparse_tensors is not None:
         assert (
@@ -2053,6 +2218,11 @@ def _flash_attn_bwd(
         causal, window_size_left, window_size_right
     )
 
+    if sm120_owner_pair and (arch//10!=12 or not causal or local
+            or softplus_balanced_m_chunk is not None or q.shape[-2]!=k.shape[-2]
+            or q.ndim!=4 or q.shape[1]>k.shape[1]
+            or any(x is not None for x in (cu_seqlens_q,cu_seqlens_k,seqused_q,seqused_k,score_mod,mask_mod,block_sparse_tensors))):
+        raise ValueError("backward owner pairing requires SM120 dense causal unsplit equal-head inputs")
     if arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
         m_block_size = 64
@@ -2063,6 +2233,10 @@ def _flash_attn_bwd(
         else:
             num_stages_Q = 1
             num_stages_dO = 1
+        if attn_kind == "softplus" and head_dim <= 128 and head_dim_v <= 128:
+            # Pipeline the next Q tile without duplicating dO's shared buffer.
+            # Unlike double-buffering both operands, this fits SM120's 99 KiB.
+            num_stages_Q, num_stages_dO = 2, 1
         SdP_swapAB = False
         dKV_swapAB = False
         dQ_swapAB = False
@@ -2073,7 +2247,22 @@ def _flash_attn_bwd(
         dQ_single_wg = False
         cluster_size = 1
         use_2cta_instrs = False
-        num_threads = 128
+        assert sm120_bwd_num_threads in (128, 256), "SM120 backward supports 128 or 256 threads"
+        num_threads = sm120_bwd_num_threads
+        if sm120_bwd_tile is not None:
+            assert sm120_bwd_tile in ((64,64,1,1),(64,64,2,1),(64,64,2,2),(64,128,1,1),
+                                     (64,32,1,1),(64,32,2,1),(64,16,1,1),(64,16,2,1)), "Unsupported SM120 backward tile"
+            if sm120_bwd_tile==(64,128,1,1):
+                assert head_dim==head_dim_v==64, "Wide SM120 backward requires D64"
+            m_block_size,n_block_size,num_stages_Q,num_stages_dO = sm120_bwd_tile
+            if n_block_size < 64:
+                assert num_threads == 128, "Narrow SM120 backward tiles require 128 threads"
+            AtomLayoutNdKV = min(4, n_block_size // 16)
+        if sm120_bwd_warp_layout is not None:
+            assert num_threads == 256 and head_dim == head_dim_v == 128
+            assert m_block_size == n_block_size == 64
+            assert len(sm120_bwd_warp_layout) == 3 and all(x in (2,4) for x in sm120_bwd_warp_layout)
+            AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ = sm120_bwd_warp_layout
         assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
         assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
@@ -2311,12 +2500,16 @@ def _flash_attn_bwd(
                 device=device,
             )
         )
-        dpsum = torch.empty(
-            batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device
-        )
-        lse_log2 = torch.empty(
-            batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device
-        )
+        if softplus_native_bwd or softplus_inline_scale:
+            # Signature/layout placeholders only: native kernel never accesses them.
+            dpsum = lse_log2 = dq_accum[:, :, :seqlen_q_rounded]
+        else:
+            dpsum = torch.empty(
+                batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device
+            )
+            lse_log2 = torch.empty(
+                batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device
+            )
     else:
         total_q_rounded_padded = (
             (total_q + cu_seqlens_q.shape[0] * m_block_size - 1) // m_block_size * m_block_size
@@ -2434,14 +2627,16 @@ def _flash_attn_bwd(
         # buffers instead carry n^-alpha to the kernel (see flash_bwd_softplus.py).
         assert not is_varlen, "softplus backward does not support varlen yet"
         if not fake_mode:
-            if dq_accum is not None:
+            if softplus_inline_scale:
                 dq_accum.zero_()
-            row_scale = _softplus_row_scale(
-                seqlen_q, seqlen_k, seqlen_q_rounded, causal or local,
-                window_size_left if local else None, softplus_alpha, device,
-            )
-            lse_log2.copy_(row_scale.expand_as(lse_log2))
-            dpsum.copy_(lse_log2)
+            elif softplus_native_bwd:
+                from nanochat.softplus_math import prepare_scaled_backward
+                dout = prepare_scaled_backward(dq_accum,dout,seqlen_k,causal or local,
+                                               window_size_left if local else None,softplus_alpha)
+            else:
+                from nanochat.softplus_math import prepare_backward
+                prepare_backward(dq_accum,lse_log2,dpsum,seqlen_q,seqlen_k,causal or local,
+                                 window_size_left if local else None,softplus_alpha)
     else:
         _bwd_preprocess(
             out, dout, dpsum, lse, lse_log2, dq_accum,
@@ -2553,6 +2748,13 @@ def _flash_attn_bwd(
             cu_total_m_blocks_k is not None,
             attn_kind,
             softplus_balanced_m_chunk,
+            softplus_early_dv,
+            softplus_native_bwd,
+            (seqlen_q,seqlen_k,window_size_left,softplus_alpha,causal or local) if softplus_inline_scale else None,
+            softplus_share_pd,
+            softplus_poly_estrin,
+            sm120_owner_pair,
+            softplus_bwd_component,
         )
     else:
         compile_key = (
@@ -2598,6 +2800,13 @@ def _flash_attn_bwd(
             use_dedicated_hd256_kernel and cu_seqlens_k is not None and max_seqlen_k is None,
             attn_kind,
             softplus_balanced_m_chunk,
+            softplus_early_dv,
+            softplus_native_bwd,
+            (seqlen_q,seqlen_k,window_size_left,softplus_alpha,causal or local) if softplus_inline_scale else None,
+            softplus_share_pd,
+            softplus_poly_estrin,
+            sm120_owner_pair,
+            softplus_bwd_component,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -2631,7 +2840,10 @@ def _flash_attn_bwd(
                     FlashAttentionBackwardSm120Softplus if arch // 10 == 12
                     else FlashAttentionBackwardSm80Softplus
                 )
-                bwd_extra_kwargs = dict(balanced_m_chunk=softplus_balanced_m_chunk)
+                bwd_extra_kwargs = dict(balanced_m_chunk=softplus_balanced_m_chunk, early_dv=softplus_early_dv, native=softplus_native_bwd, share_pd=softplus_share_pd, poly_estrin=softplus_poly_estrin, row_scale_params=(seqlen_q,seqlen_k,-1 if window_size_left is None else window_size_left,softplus_alpha,causal or local) if softplus_inline_scale else None)
+                if softplus_bwd_component is not None:
+                    from flash_attn_4.flash_bwd_softplus_split import SoftplusBackwardQK, SoftplusBackwardV
+                    flash_bwd_obj_cls = SoftplusBackwardQK if softplus_bwd_component == "qk" else SoftplusBackwardV
             else:
                 flash_bwd_obj_cls = FlashAttentionBackwardSm120 if arch // 10 == 12 else FlashAttentionBackwardSm80
                 bwd_extra_kwargs = {}
@@ -2659,6 +2871,7 @@ def _flash_attn_bwd(
                 score_mod_bwd=score_mod_bwd,
                 **bwd_extra_kwargs,
             )
+            fa_bwd_obj.column_warp_mask = arch // 10 == 12 and num_threads // 32 // AtomLayoutMSdP > 1
         elif arch // 10 == 9:
             assert attn_kind == "softmax", "softplus bwd is SM80/SM120 only so far"
             fa_bwd_obj = FlashAttentionBackwardSm90(
@@ -2741,6 +2954,11 @@ def _flash_attn_bwd(
                     q_subtile_factor=q_subtile_factor,
                     kv_subtile_factor=kv_subtile_factor,
                 )
+
+        if sm120_owner_pair:
+            from flash_attn_4.global_query_scheduler import PairedQueryScheduler
+            fa_bwd_obj.tile_scheduler_cls=PairedQueryScheduler
+            fa_bwd_obj.owner_pair=True
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
         sparse_tensors_compile = None
@@ -2849,8 +3067,8 @@ def _flash_attn_bwd(
             num_threads_post_dQ = 128 if dQ_single_wg else cfg.num_wg * 128
             num_threads_post_dKV = cfg.num_wg * 128
         else:
-            num_threads_post_dQ = 128
-            num_threads_post_dKV = 128
+            num_threads_post_dQ = num_threads if arch // 10 == 12 else 128
+            num_threads_post_dKV = num_threads if arch // 10 == 12 else 128
 
         _bwd_postprocess_convert(
             dq_accum, dq, softmax_scale,

@@ -53,7 +53,7 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
-parser.add_argument("--attn-kind", type=str, default="softmax", choices=["softmax", "softplus"], help="attention score map: softmax (FA3/FA4/SDPA) or softplus (elementwise, unnormalised, Triton kernel in nanochat/softplus_attention.py)")
+parser.add_argument("--attn-kind", type=str, default="softmax", choices=["softmax", "softplus", "softplus_rmsnorm"], help="attention score map: softmax (FA3/FA4/SDPA), softplus (elementwise, unnormalised, Triton kernel in nanochat/softplus_attention.py) or softplus_rmsnorm (softplus + per-head output RMSNorm, FA4 CuTe kernel from the flash-attention repo, see nanochat/softplus_rmsnorm_attention.py)")
 parser.add_argument("--softplus-alpha", type=float, default=1.0, help="exponent of the n^-alpha length scaling in softplus attention; 1.0 matches softmax's scale behaviour")
 parser.add_argument("--loss-chunk-tokens", type=int, default=0, help="chunk the lm_head+cross-entropy over this many tokens and recompute each chunk in backward (0 = off). Cuts the fp32 logits peak, which is the model's largest allocation, for one extra lm_head matmul")
 # Training horizon (only one used, in order of precedence)

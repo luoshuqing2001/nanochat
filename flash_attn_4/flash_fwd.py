@@ -33,7 +33,7 @@ from flash_attn_4.block_info import BlockInfo
 from flash_attn_4.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn_4.named_barrier import NamedBarrierFwd
 from flash_attn_4.block_sparsity import BlockSparseTensors
-from flash_attn_4.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
+from flash_attn_4.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments, WorkTileInfo
 from flash_attn_4.utils import AuxData
 
 
@@ -592,6 +592,11 @@ class FlashAttentionForwardBase:
 
 
 class FlashAttentionForwardSm80(FlashAttentionForwardBase):
+    softplus_fragment_n = 0
+    softplus_stream_workers = 0
+    softplus_stream_tiles = False
+    softplus_stream_global = False
+    owner_pair = False
     def _get_smem_layout_atom(self):
         sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim)
         sK_layout_atom = sQ_layout_atom
@@ -714,7 +719,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             num_head=cute.size(mQ.shape[2]),
             num_batch=num_batch,
             # LOCAL PATCH (nanochat): was hardcoded 1; see the split-KV knobs above.
-            num_splits=self.num_splits,
+            num_splits=self.softplus_stream_workers if const_expr(self.softplus_stream_workers) else self.num_splits,
             is_split_kv=self.is_split_kv,
             seqlen_k=0,
             headdim=mQ.shape[1],
@@ -805,11 +810,80 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
     ):
-        # Thread index, block index
-        tidx, _, _ = cute.arch.thread_idx()
+        if const_expr(self.owner_pair):
+            pair, head_idx, batch_idx = cute.arch.block_idx()
+            high = tile_sched_params.blocks - 1 - pair
+            count = Int32(2)
+            if high == pair:
+                count = Int32(1)
+            for part in cutlass.range(count, unroll=1):
+                m_block = high if part == 0 else pair
+                work_tile = WorkTileInfo((m_block, head_idx, batch_idx, Int32(0)), cutlass.Boolean(True))
+                self.compute_work(mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK, softmax_scale_log2, softmax_scale, window_size_left, window_size_right, sQ_layout, sK_layout, sV_layout, sO_layout, sP_layout, gmem_tiled_copy_Q, gmem_tiled_copy_K, gmem_tiled_copy_V, gmem_tiled_copy_O, tiled_mma_qk, tiled_mma_pv, SharedStorage, tile_sched_params, TileScheduler, work_tile, aux_data, fastdiv_mods)
+                # compute_work reuses Q/O shared memory; drain before the next owner.
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.barrier()
+        elif const_expr(self.softplus_stream_workers > 0):
+            worker, head_idx, batch_idx = cute.arch.block_idx()
+            if const_expr(self.softplus_stream_global):
+                bh=worker % (tile_sched_params.num_head*tile_sched_params.num_batch)
+                worker=worker // (tile_sched_params.num_head*tile_sched_params.num_batch)
+                batch_idx=bh // tile_sched_params.num_head
+                head_idx=bh % tile_sched_params.num_head
+            begin = Int32(tile_sched_params.work_table[worker, 0])
+            end = Int32(tile_sched_params.work_table[worker, 1])
+            if const_expr(self.softplus_stream_tiles):
+                segment = begin
+                m_block = Int32(tile_sched_params.work_table[segment, 0])
+                work_tile = WorkTileInfo((m_block, head_idx, batch_idx, segment), cutlass.Boolean(True))
+                self.compute_work(mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK, softmax_scale_log2, softmax_scale, window_size_left, window_size_right, sQ_layout, sK_layout, sV_layout, sO_layout, sP_layout, gmem_tiled_copy_Q, gmem_tiled_copy_K, gmem_tiled_copy_V, gmem_tiled_copy_O, tiled_mma_qk, tiled_mma_pv, SharedStorage, tile_sched_params, TileScheduler, work_tile, aux_data, fastdiv_mods)
+            else:
+                for segment in cutlass.range(begin, end, unroll=1):
+                    m_block = Int32(tile_sched_params.work_table[segment, 0])
+                    work_tile = WorkTileInfo((m_block, head_idx, batch_idx, segment), cutlass.Boolean(True))
+                    self.compute_work(mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK, softmax_scale_log2, softmax_scale, window_size_left, window_size_right, sQ_layout, sK_layout, sV_layout, sO_layout, sP_layout, gmem_tiled_copy_Q, gmem_tiled_copy_K, gmem_tiled_copy_V, gmem_tiled_copy_O, tiled_mma_qk, tiled_mma_pv, SharedStorage, tile_sched_params, TileScheduler, work_tile, aux_data, fastdiv_mods)
+                    cute.arch.cp_async_wait_group(0)
+                    cute.arch.barrier()
+        else:
+            tile_scheduler = TileScheduler.create(tile_sched_params)
+            work_tile = tile_scheduler.initial_work_tile_info()
+            self.compute_work(mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK, softmax_scale_log2, softmax_scale, window_size_left, window_size_right, sQ_layout, sK_layout, sV_layout, sO_layout, sP_layout, gmem_tiled_copy_Q, gmem_tiled_copy_K, gmem_tiled_copy_V, gmem_tiled_copy_O, tiled_mma_qk, tiled_mma_pv, SharedStorage, tile_sched_params, TileScheduler, work_tile, aux_data, fastdiv_mods)
 
-        tile_scheduler = TileScheduler.create(tile_sched_params)
-        work_tile = tile_scheduler.initial_work_tile_info()
+    @cute.jit
+    def compute_work(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mO: cute.Tensor,
+        mLSE: Optional[cute.Tensor],
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mCuSeqlensK: Optional[cute.Tensor],
+        mSeqUsedQ: Optional[cute.Tensor],
+        mSeqUsedK: Optional[cute.Tensor],
+        softmax_scale_log2: Float32,
+        softmax_scale: Optional[Float32],
+        window_size_left: Optional[Int32],
+        window_size_right: Optional[Int32],
+        sQ_layout: cute.ComposedLayout,
+        sK_layout: cute.ComposedLayout,
+        sV_layout: cute.ComposedLayout,
+        sO_layout: cute.ComposedLayout,
+        sP_layout: cute.ComposedLayout | None,
+        gmem_tiled_copy_Q: cute.TiledCopy,
+        gmem_tiled_copy_K: cute.TiledCopy,
+        gmem_tiled_copy_V: cute.TiledCopy,
+        gmem_tiled_copy_O: cute.TiledCopy,
+        tiled_mma_qk: cute.TiledMma,
+        tiled_mma_pv: cute.TiledMma,
+        SharedStorage: cutlass.Constexpr,
+        tile_sched_params,
+        TileScheduler: cutlass.Constexpr[Callable],
+        work_tile,
+        aux_data: AuxData = AuxData(),
+        fastdiv_mods=None,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
 
         if work_tile.is_valid_tile:
             m_block, num_head, batch_size, split_idx = work_tile.tile_idx
@@ -840,6 +914,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             n_block_min, n_block_max = block_info.get_n_block_min_max(
                 seqlen, m_block, split_idx, self.num_splits
             )
+            if const_expr(self.softplus_stream_workers > 0):
+                n_block_min = Int32(tile_sched_params.work_table[split_idx, 1])
+                n_block_max = Int32(tile_sched_params.work_table[split_idx, 2])
             # For varlen, wasted grid tiles (where batch_idx >= num_batch) will have
             # seqlen_q=seqlen_k=0 and n_block_max=0.  Clamp to 0 so we don't use a
             # negative block index for K/V loads; the load/store predicates already
@@ -965,6 +1042,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 tSsQ=tSsQ,
                 tSsK=tSsK,
                 tOsVt=tOsVt,
+                raw_sK=sK,
+                raw_sVt=sVt,
             )
             load_K = partial(
                 self.load_K, gmem_tiled_copy_K, tKgK, tKsK, tKcK, t0KcK, tKpK, seqlen=seqlen.seqlen_k
@@ -1111,21 +1190,27 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # ///////////////////////////////////////////////////////////////////////////////
             # reuse sQ's data iterator
             sO = cute.make_tensor(sQ.iterator, sO_layout)
-            self.epilogue(
-                acc_O,
-                softmax.row_sum,
-                mO,
-                mLSE,
-                sO,
-                seqlen,
-                gmem_tiled_copy_O,
-                None,
-                tiled_mma_pv,
-                tidx,
-                m_block,
-                num_head,
-                batch_size,
-            )
+            if const_expr(self.softplus_stream_workers > 0):
+                slot = Int32(tile_sched_params.work_table[split_idx, 3])
+                self.epilogue_stream(acc_O, softmax.row_sum, mO, mLSE, sO, seqlen,
+                    gmem_tiled_copy_O, tiled_mma_pv, tidx, m_block, num_head, batch_size,
+                    slot, aux_data.tensors)
+            else:
+                self.epilogue(
+                    acc_O,
+                    softmax.row_sum,
+                    mO,
+                    mLSE,
+                    sO,
+                    seqlen,
+                    gmem_tiled_copy_O,
+                    None,
+                    tiled_mma_pv,
+                    tidx,
+                    m_block,
+                    num_head,
+                    batch_size,
+                )
 
     @cute.jit
     def compute_one_n_block(
@@ -1155,89 +1240,95 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         subsequent blocks.
         """
 
-        def sync():
-            cute.arch.cp_async_wait_group(self.num_stages * 2 - 2)
-            cute.arch.barrier()
+        if const_expr(self.softplus_fragment_n > 0):
+            self.compute_softplus_fragments(n_block, smem_pipe_read, smem_pipe_write,
+                mma_params, smem_copy_params, softmax, load_K, load_V, m_block,
+                seqlen, is_first_n_block, mask_fn is not None)
+        else:
+            def sync():
+                cute.arch.cp_async_wait_group(self.num_stages * 2 - 2)
+                cute.arch.barrier()
 
-        acc_shape_S = mma_params.thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
-        acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
-        acc_S.fill(0.0)
-        # wait for smem tile QK before mma calculation for S
-        sync()
+            acc_shape_S = mma_params.thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
+            acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
+            acc_S.fill(0.0)
+            # wait for smem tile QK before mma calculation for S
+            sync()
 
-        # need predicates for the first tile
-        def load_V_next():
-            if self.num_stages == 1 or n_block - self.num_stages + 1 >= 0:
-                load_V(
-                    n_block - self.num_stages + 1,
-                    smem_pipe_write,
-                    need_predicates=is_first_n_block and self.num_stages == 1,
-                )
-            cute.arch.cp_async_commit_group()
+            # need predicates for the first tile
+            def load_V_next():
+                if self.num_stages == 1 or n_block - self.num_stages + 1 >= 0:
+                    load_V(
+                        n_block - self.num_stages + 1,
+                        smem_pipe_write,
+                        need_predicates=is_first_n_block and self.num_stages == 1,
+                    )
+                cute.arch.cp_async_commit_group()
 
-        load_V_next()
-        sm80_utils.gemm(
-            mma_params.thr_mma_qk,
-            acc_S,
-            mma_params.tSrQ,
-            mma_params.tSrK,
-            smem_copy_params.tSsQ,
-            smem_copy_params.tSsK[
-                None, None, None, smem_pipe_read if const_expr(self.num_stages > 1) else 0
-            ],
-            smem_copy_params.smem_thr_copy_Q,
-            smem_copy_params.smem_thr_copy_K,
-            # hook_fn=load_V_next,
-            A_in_regs=self.Q_in_regs,
-        )
-        if const_expr(score_mod is not None):
-            self.apply_score_mod(
+            load_V_next()
+            sm80_utils.gemm(
                 mma_params.thr_mma_qk,
-                batch_idx,
-                head_idx,
-                m_block,
                 acc_S,
-                n_block,
-                softmax_scale=softmax.softmax_scale,
-                seqlen=seqlen,
-                aux_data=aux_data,
-                fastdiv_mods=fastdiv_mods,
+                mma_params.tSrQ,
+                mma_params.tSrK,
+                smem_copy_params.tSsQ,
+                smem_copy_params.tSsK[
+                    None, None, None, smem_pipe_read if const_expr(self.num_stages > 1) else 0
+                ],
+                smem_copy_params.smem_thr_copy_Q,
+                smem_copy_params.smem_thr_copy_K,
+                # hook_fn=load_V_next,
+                A_in_regs=self.Q_in_regs,
             )
+            if const_expr(score_mod is not None):
+                self.apply_score_mod(
+                    mma_params.thr_mma_qk,
+                    batch_idx,
+                    head_idx,
+                    m_block,
+                    acc_S,
+                    n_block,
+                    softmax_scale=softmax.softmax_scale,
+                    seqlen=seqlen,
+                    aux_data=aux_data,
+                    fastdiv_mods=fastdiv_mods,
+                )
 
-        smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+            smem_pipe_write = self.advance_pipeline(smem_pipe_write)
 
-        def load_K_next():
-            if n_block - self.num_stages >= 0:
-                load_K(n_block - self.num_stages, smem_pipe_write, need_predicates=False)
-            cute.arch.cp_async_commit_group()
+            def load_K_next():
+                if n_block - self.num_stages >= 0:
+                    load_K(n_block - self.num_stages, smem_pipe_write, need_predicates=False)
+                cute.arch.cp_async_commit_group()
 
-        # wait for smem tile V for O
-        if const_expr(self.num_stages == 1):
-            sync()
-            load_K_next()
-        if const_expr(mask_fn is not None):
-            mask_fn(acc_S, n_block=n_block)
-        row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
-        softmax.rescale_O(mma_params.acc_O, row_scale)
-        rP = cute.make_fragment_like(acc_S, self.dtype)
-        rP.store(acc_S.load().to(self.dtype))
-        tOrP = layout_utils.reshape_acc_to_frgA(rP)
-        if const_expr(self.num_stages > 1):
-            sync()
-            load_K_next()
-        sm80_utils.gemm_rs(
-            mma_params.thr_mma_pv,
-            mma_params.acc_O,
-            tOrP,
-            mma_params.tOrVt,
-            smem_copy_params.tOsVt[
-                None, None, None, smem_pipe_read if const_expr(self.num_stages > 1) else 0
-            ],
-            smem_copy_params.smem_thr_copy_V,
-            # hook_fn=load_K_next,
-        )
-        # if const_expr(self.num_stages > 1):
-        #     load_K_next()
+            # wait for smem tile V for O
+            if const_expr(self.num_stages == 1):
+                sync()
+                load_K_next()
+            if const_expr(mask_fn is not None):
+                mask_fn(acc_S, n_block=n_block)
+            row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
+            softmax.rescale_O(mma_params.acc_O, row_scale)
+            rP = cute.make_fragment_like(acc_S, self.dtype)
+            rP.store(acc_S.load().to(self.dtype))
+            tOrP = layout_utils.reshape_acc_to_frgA(rP)
+            if const_expr(self.num_stages > 1):
+                sync()
+                load_K_next()
+            sm80_utils.gemm_rs(
+                mma_params.thr_mma_pv,
+                mma_params.acc_O,
+                tOrP,
+                mma_params.tOrVt,
+                smem_copy_params.tOsVt[
+                    None, None, None, smem_pipe_read if const_expr(self.num_stages > 1) else 0
+                ],
+                smem_copy_params.smem_thr_copy_V,
+                # hook_fn=load_K_next,
+            )
+            # if const_expr(self.num_stages > 1):
+            #     load_K_next()
+
     @cute.jit
     def apply_score_mod(
         self,

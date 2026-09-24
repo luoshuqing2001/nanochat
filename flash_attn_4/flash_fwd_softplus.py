@@ -1,6 +1,7 @@
 # Softplus attention forward, built on FA4's SM80/SM120 forward kernel.
 #
-# The mainloop is FA4's, unchanged. Only two things differ from softmax attention:
+# By default the mainloop is FA4's; the optional fragment schedule overrides it.
+# Two other differences from softmax attention:
 #
 #   1. the score map (flash_attn_4/softplus.py), swapped in through `score_map_cls`;
 #   2. the `n_i^-alpha` row scale, applied here in the epilogue.
@@ -21,12 +22,13 @@ from cutlass import Float32, Int32, const_expr
 from quack import layout_utils
 
 from flash_attn_4 import utils
+from flash_attn_4 import ampere_helpers as sm80_utils
 
 from flash_attn_4.balanced_scheduler import BalancedCausalScheduler
 from flash_attn_4.block_info import BlockInfo
 from flash_attn_4.flash_fwd import FlashAttentionForwardBase, FlashAttentionForwardSm80
 from flash_attn_4.flash_fwd_sm120 import FlashAttentionForwardSm120
-from flash_attn_4.softplus import Softplus
+from flash_attn_4.softplus import Softplus, SoftplusEstrin
 
 
 class SoftplusForwardMixin:
@@ -49,9 +51,35 @@ class SoftplusForwardMixin:
         window_size_right: Optional[int] = None,
         num_splits: int = 1,
         balanced_chunk: Optional[int] = None,
+        fragment_n: int = 0,
+        poly_estrin: bool = False,
+        stream_workers: int = 0,
+        stream_atomic: bool = False,
+        stream_tiles: bool = False,
+        stream_global: bool = False,
+        stream_complete: bool = False,
+        warp_overlap: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.softplus_stream_workers = int(stream_workers)
+        self.softplus_stream_atomic = bool(stream_atomic)
+        self.softplus_stream_tiles = bool(stream_tiles)
+        self.softplus_stream_global = bool(stream_global)
+        self.softplus_stream_complete = bool(stream_complete)
+        if stream_workers:
+            from flash_attn_4.softplus_stream import StreamCausalScheduler
+            from flash_attn_4.softplus_stream import GlobalStreamCausalScheduler
+            self.tile_scheduler_cls = GlobalStreamCausalScheduler if stream_global else StreamCausalScheduler
+        self.score_map_cls = SoftplusEstrin if poly_estrin else Softplus
+        self.softplus_warp_overlap = bool(warp_overlap)
+        fragment_n = (fragment_n or 32) if warp_overlap else fragment_n
+        self.softplus_fragment_n = int(fragment_n)
+        if warp_overlap:
+            assert self.tile_n % (2 * fragment_n) == 0
+        if fragment_n:
+            assert fragment_n in (32, 64) and self.tile_n % fragment_n == 0
+            assert not self.pack_gqa and self.score_mod is None
         self.softplus_alpha = float(softplus_alpha)
         self.window_size_left = window_size_left
         self.window_size_right = window_size_right
@@ -82,6 +110,131 @@ class SoftplusForwardMixin:
             self.is_split_kv = True
             self.n_blocks_per_split = self.balanced_chunk
             self.tile_scheduler_cls = BalancedCausalScheduler
+
+    @cute.jit
+    def compute_softplus_fragments(self, n_block, read_stage, write_stage,
+                                  mma, copies, softmax, load_K, load_V, m_block,
+                                  seqlen, is_first: cutlass.Constexpr, mask_required: cutlass.Constexpr):
+        if const_expr(self.softplus_warp_overlap):
+            self.compute_softplus_overlap(n_block,read_stage,write_stage,mma,copies,
+                softmax,load_K,load_V,m_block,seqlen,is_first,mask_required)
+        else:
+            # Keep large global->shared tiles; only the score and PV fragments shrink.
+            cute.arch.cp_async_wait_group(self.num_stages * 2 - 2)
+            cute.arch.barrier()
+            if self.num_stages == 1 or n_block - self.num_stages + 1 >= 0:
+                load_V(n_block - self.num_stages + 1, write_stage,
+                       need_predicates=is_first and self.num_stages == 1)
+            cute.arch.cp_async_commit_group()
+            next_stage = self.advance_pipeline(write_stage)
+            for f in cutlass.range_constexpr(self.tile_n // self.softplus_fragment_n):
+                k_tile = cute.local_tile(copies.raw_sK[None, None, read_stage],
+                                        (self.softplus_fragment_n, self.tile_hdim), (f, 0))
+                vt_tile = cute.local_tile(copies.raw_sVt[None, None, read_stage],
+                                         (self.tile_hdimv, self.softplus_fragment_n), (0, f))
+                kr = mma.thr_mma_qk.make_fragment_B(mma.thr_mma_qk.partition_B(k_tile))
+                vr = mma.thr_mma_pv.make_fragment_B(mma.thr_mma_pv.partition_B(vt_tile))
+                ks = copies.smem_thr_copy_K.partition_S(k_tile)
+                vs = copies.smem_thr_copy_V.partition_S(vt_tile)
+                scores = cute.make_rmem_tensor(
+                    mma.thr_mma_qk.partition_shape_C((self.tile_m, self.softplus_fragment_n)), Float32)
+                scores.fill(0.0)
+                sm80_utils.gemm(mma.thr_mma_qk, scores, mma.tSrQ, kr,
+                               copies.tSsQ, ks, copies.smem_thr_copy_Q,
+                               copies.smem_thr_copy_K, A_in_regs=self.Q_in_regs)
+                if const_expr(mask_required):
+                    coords = mma.thr_mma_qk.partition_C(
+                        cute.make_identity_tensor((self.tile_m, self.softplus_fragment_n)))
+                    for i in cutlass.range_constexpr(cute.size(scores)):
+                        row = m_block * self.tile_m + coords[i][0]
+                        col = n_block * self.tile_n + f * self.softplus_fragment_n + coords[i][1]
+                        valid = (row < seqlen.seqlen_q) & (col < seqlen.seqlen_k)
+                        if const_expr(self.is_causal or self.is_local):
+                            valid = valid & (col <= row + seqlen.seqlen_k - seqlen.seqlen_q)
+                        if const_expr(self.window_size_left is not None):
+                            valid = valid & (col >= row + seqlen.seqlen_k - seqlen.seqlen_q - self.window_size_left)
+                        scores[i] = scores[i] if valid else -Float32.inf
+                softmax.online_softmax(scores)
+                p = cute.make_fragment_like(scores, self.dtype)
+                p.store(scores.load().to(self.dtype))
+                if const_expr(f == 0):
+                    cute.arch.cp_async_wait_group(self.num_stages * 2 - 2)
+                    cute.arch.barrier()
+                if const_expr(f == self.tile_n // self.softplus_fragment_n - 1):
+                    # No warp may overwrite K until all warps have consumed it.
+                    cute.arch.barrier()
+                    if n_block - self.num_stages >= 0:
+                        load_K(n_block - self.num_stages, next_stage, need_predicates=False)
+                    cute.arch.cp_async_commit_group()
+                sm80_utils.gemm_rs(mma.thr_mma_pv, mma.acc_O,
+                                  layout_utils.reshape_acc_to_frgA(p), vr, vs,
+                                  copies.smem_thr_copy_V)
+
+    @cute.jit
+    def overlap_qk(self, scores, f: cutlass.Constexpr, read_stage, mma, copies):
+        kt=cute.local_tile(copies.raw_sK[None,None,read_stage],
+                           (self.softplus_fragment_n,self.tile_hdim),(f,0))
+        kr=mma.thr_mma_qk.make_fragment_B(mma.thr_mma_qk.partition_B(kt))
+        ks=copies.smem_thr_copy_K.partition_S(kt)
+        scores.fill(0.0)
+        sm80_utils.gemm(mma.thr_mma_qk,scores,mma.tSrQ,kr,copies.tSsQ,ks,
+                       copies.smem_thr_copy_Q,copies.smem_thr_copy_K,A_in_regs=self.Q_in_regs)
+
+    @cute.jit
+    def overlap_pv(self, scores, f: cutlass.Constexpr, n_block, m_block, read_stage,
+                   mma, copies, softmax, seqlen, mask_required: cutlass.Constexpr):
+        if const_expr(mask_required):
+            coords=mma.thr_mma_qk.partition_C(cute.make_identity_tensor((self.tile_m,self.softplus_fragment_n)))
+            for i in cutlass.range_constexpr(cute.size(scores)):
+                row=m_block*self.tile_m+coords[i][0]
+                col=n_block*self.tile_n+f*self.softplus_fragment_n+coords[i][1]
+                valid=(row<seqlen.seqlen_q)&(col<seqlen.seqlen_k)
+                if const_expr(self.is_causal or self.is_local):
+                    valid=valid&(col<=row+seqlen.seqlen_k-seqlen.seqlen_q)
+                if const_expr(self.window_size_left is not None):
+                    valid=valid&(col>=row+seqlen.seqlen_k-seqlen.seqlen_q-self.window_size_left)
+                scores[i]=scores[i] if valid else -Float32.inf
+        softmax.online_softmax(scores)
+        p=cute.make_fragment_like(scores,self.dtype)
+        p.store(scores.load().to(self.dtype))
+        vt=cute.local_tile(copies.raw_sVt[None,None,read_stage],
+                           (self.tile_hdimv,self.softplus_fragment_n),(0,f))
+        vr=mma.thr_mma_pv.make_fragment_B(mma.thr_mma_pv.partition_B(vt))
+        vs=copies.smem_thr_copy_V.partition_S(vt)
+        sm80_utils.gemm_rs(mma.thr_mma_pv,mma.acc_O,layout_utils.reshape_acc_to_frgA(p),
+                          vr,vs,copies.smem_thr_copy_V)
+
+    @cute.jit
+    def compute_softplus_overlap(self,n_block,read_stage,write_stage,mma,copies,
+                                  softmax,load_K,load_V,m_block,seqlen,
+                                  is_first:cutlass.Constexpr,mask_required:cutlass.Constexpr):
+        cute.arch.cp_async_wait_group(self.num_stages*2-2)
+        cute.arch.barrier()
+        if self.num_stages==1 or n_block-self.num_stages+1>=0:
+            load_V(n_block-self.num_stages+1,write_stage,need_predicates=is_first and self.num_stages==1)
+        cute.arch.cp_async_commit_group()
+        next_stage=self.advance_pipeline(write_stage)
+        for pair in cutlass.range_constexpr(self.tile_n//(2*self.softplus_fragment_n)):
+            s0=cute.make_rmem_tensor(mma.thr_mma_qk.partition_shape_C((self.tile_m,self.softplus_fragment_n)),Float32)
+            s1=cute.make_rmem_tensor(mma.thr_mma_qk.partition_shape_C((self.tile_m,self.softplus_fragment_n)),Float32)
+            self.overlap_qk(s0,2*pair,read_stage,mma,copies)
+            if const_expr(pair==0):
+                cute.arch.cp_async_wait_group(self.num_stages*2-2)
+                cute.arch.barrier()
+            # Warp-uniform branches, no barrier inside either branch. Each warp
+            # owns its query rows and O; only read-only KV storage is shared.
+            if cute.arch.warp_idx()%4<2:
+                self.overlap_pv(s0,2*pair,n_block,m_block,read_stage,mma,copies,softmax,seqlen,mask_required)
+                self.overlap_qk(s1,2*pair+1,read_stage,mma,copies)
+            else:
+                self.overlap_qk(s1,2*pair+1,read_stage,mma,copies)
+                self.overlap_pv(s0,2*pair,n_block,m_block,read_stage,mma,copies,softmax,seqlen,mask_required)
+            if const_expr(pair==self.tile_n//(2*self.softplus_fragment_n)-1):
+                cute.arch.barrier()
+                if n_block-self.num_stages>=0:
+                    load_K(n_block-self.num_stages,next_stage,need_predicates=False)
+                cute.arch.cp_async_commit_group()
+            self.overlap_pv(s1,2*pair+1,n_block,m_block,read_stage,mma,copies,softmax,seqlen,mask_required)
 
     def _check_type(self, mQ_type, mK_type, mV_type, mO_type, *args):
         # The split path accumulates into an fp32 O, which upstream's check rejects
@@ -163,6 +316,51 @@ class SoftplusForwardMixin:
             acc_O, lse, mO, mLSE, sO, seqlen, gmem_tiled_copy_O, tma_atom_O,
             tiled_mma, tidx, m_block, head_idx, batch_idx,
         )
+
+    @cute.jit
+    def epilogue_stream(self, acc_O, lse, mO, mLSE, sO, seqlen, gmem_copy,
+                        mma, tidx, m_block, head_idx, batch_idx, slot, tensors):
+        partial = tensors[0]
+        if slot < 0:
+            self.apply_count_scale(acc_O, mma, tidx, m_block, seqlen)
+            FlashAttentionForwardBase.epilogue(self, acc_O, lse, mO, mLSE, sO,
+                seqlen, gmem_copy, None, mma, tidx, m_block, head_idx, batch_idx)
+        else:
+            # Whole tiles bypass this path. Split tiles use either a private slot
+            # or a shared zeroed FP32 slot; kernel completion orders the finish pass.
+            bh = batch_idx * cute.size(mO.shape[2]) + head_idx
+            target = cute.local_tile(partial[bh, slot, None, None],
+                                     (self.tile_m, self.tile_hdimv), (0, 0))
+            dest = mma.get_slice(tidx).partition_C(target)
+            if const_expr(self.softplus_stream_atomic):
+                for i in cutlass.range(cute.size(acc_O), unroll_full=True):
+                    cute.arch.atomic_add(ptr=utils.elem_pointer(dest, i), val=acc_O[i])
+            else:
+                cute.autovec_copy(acc_O, dest)
+            if const_expr(self.softplus_stream_complete):
+                counters,meta=tensors[1],tensors[2]
+                group=Int32(meta[m_block,0])
+                first=Int32(meta[m_block,1])
+                count=Int32(meta[m_block,2])
+                # Publish every thread's stores before the CTA leader announces completion.
+                cute.arch.fence_acq_rel_gpu()
+                cute.arch.barrier()
+                if tidx==0:
+                    old=cute.arch.atomic_add(ptr=utils.elem_pointer(counters,(bh,group)),
+                        val=Int32(1),sem="acq_rel",scope="gpu")
+                    sO[0]=(old==count-1).to(sO.element_type)
+                cute.arch.barrier()
+                last=Int32(sO[0])
+                cute.arch.barrier()  # Everyone consumes the flag before sO is reused.
+                if last!=0:
+                    acc_O.fill(0.0)
+                    for part in cutlass.range(first,first+count,unroll=1):
+                        src=mma.get_slice(tidx).partition_C(partial[bh,part,None,None])
+                        for i in cutlass.range(cute.size(acc_O),unroll_full=True):
+                            acc_O[i]=acc_O[i]+src[i]
+                    self.apply_count_scale(acc_O,mma,tidx,m_block,seqlen)
+                    FlashAttentionForwardBase.epilogue(self,acc_O,lse,mO,mLSE,sO,
+                        seqlen,gmem_copy,None,mma,tidx,m_block,head_idx,batch_idx)
 
     @cute.jit
     def split_is_empty(self, seqlen, m_block: Int32) -> cutlass.Boolean:
