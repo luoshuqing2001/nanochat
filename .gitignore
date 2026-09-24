@@ -17,13 +17,28 @@ base_data_climbmix/
 base_data/
 
 # Experiment logs: the small text record under logs/<run_id>/ is committed on purpose
-# (config.json, env.txt, command.txt, train.log, metrics.jsonl, summary.*), so only
-# heavy or noisy artifacts are excluded here.
+# (config.json, env.txt, command.txt, metrics.jsonl, summary.*). env.txt is the reason --
+# the hermetic exp_*.sh pins the config, but nothing else records the driver and library
+# versions of the machine that produced a curve, and runs now move between GB10, B200 and
+# Pro 6000. train.log is excluded: it carries the same per-step numbers as metrics.jsonl
+# in a form nothing parses, and grows ~2 MB over a 7,560-step run.
 logs/**/*.pt
 logs/**/*.pth
 logs/**/*.safetensors
+logs/**/train.log
 logs/*_smoke_*/
 *.screenlog
+
+# CuTe DSL JIT cache, dropped in whatever directory the process started in
+*.cubin
+
+# Raw benchmark and tuning sweeps. The conclusions live in trains/SOFTPLUS_*.md; these
+# are the per-configuration numbers behind them, regenerable by the bench_*/tune_* scripts
+# and specific to one machine.
+trains/softplus_*.json
+trains/softplus_*.csv
+trains/softplus_*.log
+trains/*.metadata.json
 
 # Local tooling / build cruft
 .claude/settings.local.json
