@@ -47,3 +47,6 @@ trains/*.metadata.json
 build/
 dist/
 .DS_Store
+
+# Runs that did not finish. Commit a record when there is a result to record.
+logs/d12_hybridswa_muon_20260924_004434/
