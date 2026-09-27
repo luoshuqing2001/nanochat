@@ -178,9 +178,15 @@ def activation_report(model, x, max_query_sample=128):
     gpt_module.flash_attn = spy
     was_training = model.training
     model.eval()
+    # Nothing here reads the logits, and they are the biggest allocation of the forward:
+    # fp32 B x T x vocab, 8 GiB per buffer at bs 32 x 2048 x 32768, several of them through
+    # the softcap. On top of the training step's cached blocks that OOM'd a d20 on an 80 GB
+    # H100 at step 1500. Shadowing the method skips lm_head; the hooked stats are unchanged.
+    model.compute_logits = lambda h: None
     try:
         model(x)
     finally:
+        del model.compute_logits
         gpt_module.flash_attn = real
         for h in handles:
             h.remove()
