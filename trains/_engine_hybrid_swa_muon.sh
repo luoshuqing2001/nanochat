@@ -57,6 +57,12 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_DIR"
 
+# The repo's .venv when there is one, whether or not the launching shell activated it: a bare
+# `python` from another env (e.g. conda's torch 2.14) runs different kernels -- NaN gradients from
+# step 1 with the FA3 softplus-family builds (compiled against the .venv's torch), and softmax fails.
+if [ -z "${PYTHON_BIN:-}" ] && [ -x "$REPO_DIR/.venv/bin/python" ]; then
+    PYTHON_BIN="$REPO_DIR/.venv/bin/python"
+fi
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 # -----------------------------------------------------------------------------
@@ -455,6 +461,9 @@ LOSS_CHUNK_TOKENS="${LOSS_CHUNK_TOKENS:-0}"
 # Attention score map: softmax (FA3/FA4/SDPA) or softplus (elementwise, unnormalised).
 ATTN_KIND="${ATTN_KIND:-softmax}"
 SOFTPLUS_ALPHA="${SOFTPLUS_ALPHA:-1.0}"
+ATTN_GAMMA_LR_MULT="${ATTN_GAMMA_LR_MULT:-1.0}"   # rmsnorm kinds: lr multiplier of the output RMSNorm gains
+ATTN_GAMMA_LR_TIE="${ATTN_GAMMA_LR_TIE:-1}"       # ... and 1: also scaled by MATRIX_LR / the variant's default
+STOP_AT_STEP="${STOP_AT_STEP:--1}"                 # leave the loop early, schedule unchanged (probes)
 
 FP8="${FP8:-0}"
 FP8_RECIPE="${FP8_RECIPE:-tensorwise}"   # tensorwise (faster) | rowwise (more accurate)
@@ -569,6 +578,17 @@ mkdir -p "$RUN_DIR"
     echo "data_dir: $NANOCHAT_DATA_DIR ($NUM_SHARDS parquet shards)"
     echo "checkpoint_dir: $CKPT_DIR"
     echo "nproc_per_node: $NPROC_PER_NODE"
+    if [ "$ATTN_KIND" = "rexp_rmsnorm" ] || [ "$ATTN_KIND" = "softplus_rmsnorm" ]; then
+        # the FA3 kernels live in another repo: record which build, and the kernel-path switches
+        FN_DIR="${NANOCHAT_FA3_FN_DIR:-$(dirname "$REPO_DIR")/flash-attention/hopper_softplus/build}"
+        echo "fa3_fn_dir: $FN_DIR"
+        echo "fa3_fn_git: $(git -C "$FN_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo n/a)" \
+             "$(git -C "$FN_DIR" rev-parse HEAD 2>/dev/null || echo n/a)" \
+             "(dirty files: $(git -C "$FN_DIR" status --short 2>/dev/null | wc -l))"
+        echo "nanochat_fa3_fuse_proj: ${NANOCHAT_FA3_FUSE_PROJ:-0}"
+        echo "nanochat_fa3_dqfuse: ${NANOCHAT_FA3_DQFUSE:-0}"
+        echo "nanochat_fa3_dgain: ${NANOCHAT_FA3_DGAIN:-1}"
+    fi
     echo "gpus:"
     nvidia-smi --query-gpu=index,name,driver_version,memory.total --format=csv 2>/dev/null | sed 's/^/  /'
 } > "$RUN_DIR/env.txt"
@@ -587,6 +607,9 @@ cat > "$RUN_DIR/config.json" <<JSON
   "loss_chunk_tokens": $LOSS_CHUNK_TOKENS,
   "attn_kind": "$ATTN_KIND",
   "softplus_alpha": $SOFTPLUS_ALPHA,
+  "attn_gamma_lr_mult": $ATTN_GAMMA_LR_MULT,
+  "attn_gamma_lr_tie": $ATTN_GAMMA_LR_TIE,
+  "stop_at_step": $STOP_AT_STEP,
   "fp8": $([ "$FP8" = "1" ] && echo true || echo false),
   "fp8_recipe": "$FP8_RECIPE",
   "device_batch_size": $DEVICE_BATCH_SIZE,
@@ -628,6 +651,9 @@ TRAIN_ARGS=(
     --loss-chunk-tokens="$LOSS_CHUNK_TOKENS"
     --attn-kind="$ATTN_KIND"
     --softplus-alpha="$SOFTPLUS_ALPHA"
+    --attn-gamma-lr-mult="$ATTN_GAMMA_LR_MULT"
+    --attn-gamma-lr-tie="$ATTN_GAMMA_LR_TIE"
+    --stop-at-step="$STOP_AT_STEP"
     --device-batch-size="$DEVICE_BATCH_SIZE"
     --total-batch-size="$TOTAL_BATCH_SIZE"
     --matrix-lr="$MATRIX_LR"
@@ -658,7 +684,7 @@ fi
 TRAIN_ARGS+=("$@")   # pass-through overrides
 
 if [ "$NPROC_PER_NODE" -gt 1 ]; then
-    LAUNCH=("torchrun" "--standalone" "--nproc_per_node=$NPROC_PER_NODE" "-m" "scripts.base_train" "--")
+    LAUNCH=("$PYTHON_BIN" "-m" "torch.distributed.run" "--standalone" "--nproc_per_node=$NPROC_PER_NODE" "-m" "scripts.base_train" "--")
 else
     LAUNCH=("$PYTHON_BIN" "-m" "scripts.base_train")
 fi
@@ -696,7 +722,7 @@ if [ "$TRAIN_STATUS" -eq 0 ] && [ -n "$FINAL_EVAL" ] && [ "$FINAL_EVAL" != "none
         --max-per-task="$FINAL_EVAL_MAX_PER_TASK"
     )
     if [ "$NPROC_PER_NODE" -gt 1 ]; then
-        EVAL_LAUNCH=("torchrun" "--standalone" "--nproc_per_node=$NPROC_PER_NODE" "-m" "scripts.base_eval" "--")
+        EVAL_LAUNCH=("$PYTHON_BIN" "-m" "torch.distributed.run" "--standalone" "--nproc_per_node=$NPROC_PER_NODE" "-m" "scripts.base_eval" "--")
     else
         EVAL_LAUNCH=("$PYTHON_BIN" "-m" "scripts.base_eval")
     fi

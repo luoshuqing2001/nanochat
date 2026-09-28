@@ -1,0 +1,24 @@
+# Overnight on 8 single-GPU slots (~10 h). Full d12 runs are ~6.5-7 h on one GPU, probes ~50 min.
+#
+# 1) the output RMSNorm gain's lr at the normal matrix LR (0.004): is gain x1 (val bpb 0.7747, the
+#    2026-09-28 05:32 8-GPU run; softmax 0.7745) leaving quality on the table?
+exp_d12_12b_lr_full.sh ARM=rexp LR_MULT=1 GAMMA_MULT=2
+exp_d12_12b_lr_full.sh ARM=rexp LR_MULT=1 GAMMA_MULT=4
+exp_d12_12b_lr_full.sh ARM=rexp LR_MULT=1 GAMMA_MULT=8
+exp_d12_12b_lr_full.sh ARM=rexp LR_MULT=1 GAMMA_MULT=16
+# 2) stability sweep, first 3000 steps: softmax vs rexp with the gain lr tied to MATRIX_LR
+exp_d12_12b_hlr_probe.sh ARM=softmax LR_MULT=1
+exp_d12_12b_hlr_probe.sh ARM=rexp LR_MULT=1
+exp_d12_12b_hlr_probe.sh ARM=softmax LR_MULT=2
+exp_d12_12b_hlr_probe.sh ARM=rexp LR_MULT=2
+exp_d12_12b_hlr_probe.sh ARM=softmax LR_MULT=4
+exp_d12_12b_hlr_probe.sh ARM=rexp LR_MULT=4
+exp_d12_12b_hlr_probe.sh ARM=softmax LR_MULT=8
+exp_d12_12b_hlr_probe.sh ARM=rexp LR_MULT=8
+exp_d12_12b_hlr_probe.sh ARM=softmax LR_MULT=16
+exp_d12_12b_hlr_probe.sh ARM=rexp LR_MULT=16
+# 3) does tied rexp turn a higher LR into a lower final loss than softmax does?
+exp_d12_12b_lr_full.sh ARM=softmax LR_MULT=2
+exp_d12_12b_lr_full.sh ARM=rexp LR_MULT=2
+exp_d12_12b_lr_full.sh ARM=softmax LR_MULT=4
+exp_d12_12b_lr_full.sh ARM=rexp LR_MULT=4
