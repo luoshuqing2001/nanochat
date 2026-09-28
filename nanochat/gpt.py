@@ -40,7 +40,10 @@ class GPTConfig:
     # Attention score map: "softmax" (normalised, FA3/FA4/SDPA), "softplus"
     # (elementwise, unnormalised, scaled by n^-softplus_alpha; see softplus_attention.py) or
     # "softplus_rmsnorm" (unnormalised softplus, then a per-head output RMSNorm with a learned
-    # gain folded into c_proj; see softplus_rmsnorm_attention.py)
+    # gain folded into c_proj; see softplus_rmsnorm_attention.py). "rexp_rmsnorm" is the same
+    # with a cheaper softplus-shaped function in place of softplus (FA3 kernels, SM90; see
+    # fn_rmsnorm_attention.py). "softmax_rmsnorm" is softmax attention followed by the same per-head
+    # output RMSNorm + gain -- an ablation separating the norm from the unnormalized score map
     attn_kind: str = "softmax"
     softplus_alpha: float = 1.0
 
@@ -87,7 +90,8 @@ class CausalSelfAttention(nn.Module):
         self.attn_kind = config.attn_kind
         self.softplus_alpha = config.softplus_alpha
         # softplus_rmsnorm: per-head RMSNorm gain on the attention output, (n_head * head_dim,)
-        self.attn_gamma = nn.Parameter(torch.ones(self.n_embd)) if self.attn_kind == "softplus_rmsnorm" else None
+        rmsnorm_kinds = ("softplus_rmsnorm", "rexp_rmsnorm", "softmax_rmsnorm")
+        self.attn_gamma = nn.Parameter(torch.ones(self.n_embd)) if self.attn_kind in rmsnorm_kinds else None
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
@@ -115,7 +119,11 @@ class CausalSelfAttention(nn.Module):
 
         # Flash Attention (FA3 or SDPA fallback)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if self.attn_kind == "softplus_rmsnorm":
+        # softplus_rmsnorm on Hopper: the FA3 build of the same attention (fn_rmsnorm_attention.py);
+        # the CuTe kernels of softplus_rmsnorm_attention.py are SM80/SM120 only
+        fn_kinds = ("rexp_rmsnorm",) + (
+            ("softplus_rmsnorm",) if q.is_cuda and torch.cuda.get_device_capability(q.device)[0] == 9 else ())
+        if self.attn_kind == "softplus_rmsnorm" and self.attn_kind not in fn_kinds:
             # Output is RMS-normalised per head; the gain is applied through c_proj below
             from nanochat.softplus_rmsnorm_attention import (
                 softplus_rmsnorm_attn_func, softplus_rmsnorm_attn_with_kvcache)
@@ -126,6 +134,29 @@ class CausalSelfAttention(nn.Module):
                 y = softplus_rmsnorm_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v,
                                                        cache_seqlens=kv_cache.cache_seqlens,
                                                        window_size=window_size)
+                if self.layer_idx == kv_cache.n_layers - 1:
+                    kv_cache.advance(T)
+        elif self.attn_kind in fn_kinds:
+            # Output is RMS-normalised per head; the gain is applied through c_proj below
+            import nanochat.fn_rmsnorm_attention as fna
+            if kv_cache is None:
+                if (fna.FUSE_PROJ and type(self.c_proj).__name__ == "Float8Linear"
+                        and self.attn_kind != "softplus_rmsnorm"):  # no *_du build of it
+                    # attention + gain + FP8 c_proj in one op: the output RMSNorm's backward runs
+                    # inside c_proj's grad GEMM (fn_rmsnorm_attention.py, fused_proj_rmsnorm.py)
+                    return fna.fn_rmsnorm_attn_proj_fp8(q, k, v, self.attn_kind, self.attn_gamma,
+                                                        self.c_proj.weight, window_size=window_size)
+                if type(self.c_proj).__name__ == "Float8Linear" and fna.dgain_ok(q, self.attn_kind):
+                    # attention and the gain as one autograd node: bit-identical, but the backward
+                    # doesn't materialize dy (fn_rmsnorm_attention.py, DGAIN)
+                    y = fna.fn_rmsnorm_attn_gain(q, k, v, self.attn_kind, self.attn_gamma, window_size=window_size)
+                    return self.c_proj(y)
+                y = fna.fn_rmsnorm_attn_func(q, k, v, self.attn_kind, window_size=window_size)
+            else:
+                k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+                y = fna.fn_rmsnorm_attn_with_kvcache(q, k_cache, v_cache, self.attn_kind, k=k, v=v,
+                                                 cache_seqlens=kv_cache.cache_seqlens,
+                                                 window_size=window_size)
                 if self.layer_idx == kv_cache.n_layers - 1:
                     kv_cache.advance(T)
         elif self.attn_kind == "softplus":
@@ -158,6 +189,11 @@ class CausalSelfAttention(nn.Module):
             # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
+
+        if self.attn_kind == "softmax_rmsnorm":
+            # per head, over head_dim, fp32 -- what the softplus kernels do to U (eps as theirs); the gain is
+            # applied through c_proj below like the other rmsnorm kinds
+            y = F.rms_norm(y.float(), (y.size(-1),), eps=1e-6).to(y.dtype)
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
@@ -474,7 +510,8 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, muon_variant="nanochat"):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, muon_variant="nanochat",
+                        attn_gamma_lr_mult=1.0):
         model_dim = self.config.n_embd
 
         # Separate out all parameters into groups
@@ -505,7 +542,8 @@ class GPT(nn.Module):
         ]
         if attn_gamma_params:
             # same lr/betas as the other per-channel scalars (resid_lambdas), no weight decay
-            param_groups.append(dict(kind='adamw', params=attn_gamma_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
+            param_groups.append(dict(kind='adamw', params=attn_gamma_params, lr=scalar_lr * 0.01 * attn_gamma_lr_mult,
+                                     betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]

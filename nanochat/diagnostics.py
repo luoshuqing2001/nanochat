@@ -223,6 +223,38 @@ def activation_report(model, x, max_query_sample=128):
     return stats
 
 
+@torch.no_grad()
+def weight_report(model):
+    """Per-layer norms of the attention output path: the RMSNorm gain gamma (rmsnorm kinds), the attention
+    c_proj weight, and their product W diag(gamma) -- what a unit-RMS attention output is scaled by on its
+    way into the residual stream (the only knobs an RMS-normalized attention has) -- with the MLP's c_proj
+    and c_v for scale. RMS = ||.||_F / sqrt(numel)."""
+    stats, cols = {}, {}
+
+    def rms(t):
+        return t.detach().float().pow(2).mean().sqrt()
+
+    for block in model.transformer.h:
+        attn = block.attn
+        w = attn.c_proj.weight
+        gamma = getattr(attn, "attn_gamma", None)
+        cols.setdefault("weight_rms/attn_c_proj", []).append(rms(w))
+        cols.setdefault("weight_rms/attn_c_v", []).append(rms(attn.c_v.weight))
+        cols.setdefault("weight_rms/mlp_c_proj", []).append(rms(block.mlp.c_proj.weight))
+        if gamma is not None:
+            g = gamma.detach().float()
+            cols.setdefault("attn_gamma/rms", []).append(g.pow(2).mean().sqrt())
+            cols.setdefault("attn_gamma/max_abs", []).append(g.abs().max())
+            cols.setdefault("attn_gamma/min", []).append(g.min())
+            cols.setdefault("weight_rms/attn_c_proj_x_gamma", []).append(rms(w.float() * g))
+    for name, values in cols.items():
+        v = torch.stack(values).float().cpu()
+        stats[f"{name}/min"] = v.min().item()
+        stats[f"{name}/max"] = v.max().item()
+        stats[f"{name}/per_layer"] = [round(t, 6) for t in v.tolist()]
+    return stats
+
+
 # -----------------------------------------------------------------------------
 # Reporting
 # -----------------------------------------------------------------------------
@@ -245,6 +277,13 @@ def format_line(step, stats):
     if "act_rms/block/max" in stats:
         parts.append(f"act rms block {g('act_rms/block/min'):.2f}-{g('act_rms/block/max'):.2f} "
                      f"attn {g('act_rms/attn/max'):.2f} mlp {g('act_rms/mlp/max'):.2f}")
+    if "attn_gamma/rms/max" in stats:
+        parts.append(f"gamma rms {g('attn_gamma/rms/min'):.3f}-{g('attn_gamma/rms/max'):.3f} "
+                     f"max|g| {g('attn_gamma/max_abs/max'):.2f} min {g('attn_gamma/min/min'):.2f} "
+                     f"| W*g rms {g('weight_rms/attn_c_proj_x_gamma/min'):.2e}-{g('weight_rms/attn_c_proj_x_gamma/max'):.2e}")
+    if "weight_rms/attn_c_proj/max" in stats:
+        parts.append(f"W rms attn_c_proj {g('weight_rms/attn_c_proj/min'):.2e}-{g('weight_rms/attn_c_proj/max'):.2e} "
+                     f"mlp_c_proj {g('weight_rms/mlp_c_proj/min'):.2e}-{g('weight_rms/mlp_c_proj/max'):.2e}")
     if "scalars/resid_lambdas/min" in stats:
         parts.append(f"resid_lambda {g('scalars/resid_lambdas/min'):.3f}-{g('scalars/resid_lambdas/max'):.3f} "
                      f"x0_lambda {g('scalars/x0_lambdas/min'):.3f}-{g('scalars/x0_lambdas/max'):.3f}")
