@@ -1,0 +1,10 @@
+bt_base | d12 full: stock 1.203 quad 1.268 this 1.258 (0.956x) | d20 SWA: stock 1.315 quad 1.395 this 1.389 (0.946x) | causal 8k: stock 4.762 quad 4.966 this 5.019 (0.949x) | non-causal 2k: stock 2.608 quad 2.623 this 2.651 (0.984x)
+bt_vreg | d12 full: stock 1.197 quad 1.272 this 1.614 (0.742x) | d20 SWA: stock 1.313 quad 1.386 this 1.691 (0.776x) | causal 8k: stock 4.925 quad 4.962 this 6.917 (0.712x) | non-causal 2k: stock 2.627 quad 2.618 this 3.685 (0.713x)
+bt_ds1 | d12 full: stock 1.202 quad 1.272 this 1.290 (0.932x) | d20 SWA: stock 1.315 quad 1.395 this 1.397 (0.941x) | causal 8k: stock 4.780 quad 5.051 this 5.133 (0.931x) | non-causal 2k: stock 2.588 quad 2.629 this 2.775 (0.933x)
+bt_do1 | d12 full: stock 1.206 quad 1.271 this 1.285 (0.938x) | d20 SWA: stock 1.312 quad 1.392 this 1.427 (0.919x) | causal 8k: stock 4.772 quad 4.980 this 4.999 (0.955x) | non-causal 2k: stock 2.595 quad 2.619 this 2.690 (0.965x)
+bt_nosdp | d12 full: stock 1.210 quad 1.272 this 1.315 (0.920x) | d20 SWA: stock 1.317 quad 1.402 this 1.444 (0.912x) | causal 8k: stock 4.799 quad 4.974 this 5.257 (0.913x) | non-causal 2k: stock 2.584 quad 2.621 this 2.908 (0.888x)
+bt_dkvsw | d12 full: stock 1.214 quad 1.278 this 1.380 (0.880x) | d20 SWA: stock 1.320 quad 1.396 this 1.483 (0.890x) | causal 8k: stock 4.823 quad 5.021 this 5.702 (0.846x) | non-causal 2k: stock 2.645 quad 2.618 this 3.035 (0.871x)
+bt_dqsw | d12 full: stock 1.210 quad 1.274 this 1.274 (0.950x) | d20 SWA: stock 1.317 quad 1.394 this 1.397 (0.943x) | causal 8k: stock 4.751 quad 4.954 this 4.958 (0.958x) | non-causal 2k: stock 2.607 quad 2.619 this 2.618 (0.996x)
+bt_m80 | d12 full: stock 1.213 quad 1.282 this 1.317 (0.921x) | d20 SWA: stock 1.316 quad 1.402 this 1.467 (0.897x) | causal 8k: stock 4.819 quad 5.118 this 5.133 (0.939x) | non-causal 2k: stock 2.602 quad 2.637 this 2.731 (0.953x)
+CUDA error (/home/sky/pretrain_data/lsq_dev/flash-attention/hopper/flash_bwd_launch_template.h:231): invalid argument
+CUDA error (/home/sky/pretrain_data/lsq_dev/flash-attention/hopper/flash_bwd_launch_template.h:231): invalid argument

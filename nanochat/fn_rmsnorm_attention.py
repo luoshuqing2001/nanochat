@@ -12,10 +12,9 @@ x far right; convex, C2), which is not a softplus approximation -- it defines a 
 
 The RMSNorm gain is folded into c_proj by CausalSelfAttention, as for softplus_rmsnorm.
 
-Training uses the FA3 kernels (SM90 only), loaded as prebuilt shared libraries from
-$NANOCHAT_FA3_FN_DIR (default: ../flash-attention/hopper_softplus/build next to this repo; build
-them with `python hopper_softplus/build.py fn_rexp_pre fn_rexp_pre_g bwd_sp_poly3 bwd_sp_poly3_g` in the
-flash-attention repo). Inference
+Training uses the FA3 kernels (SM90 only), loaded as prebuilt shared libraries: the sources are
+vendored in third_party/fa3_softplus, `bash trains/build_fa3_softplus.sh` builds them (see _LIB_DIR
+below for where they are looked up). Inference
 with a KV cache, and every non-SM90 device, uses the float32 torch reference below: correct, but
 it materializes the score matrix, so it is for sampling/eval and tests, not for training.
 """
@@ -146,8 +145,13 @@ def dgain_ok(q, kind):
     """Whether fn_rmsnorm_attn_gain applies: the switch, the device, and a *_g build for the kind."""
     return DGAIN and _fa3_ok(q) and KIND_TO_BUILD.get(kind) in G_BUILDS and not DQFUSE
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_LIB_DIR = os.environ.get("NANOCHAT_FA3_FN_DIR") or os.path.join(
-    os.path.dirname(_REPO), "flash-attention", "hopper_softplus", "build")
+# The kernels' sources are vendored in third_party/fa3_softplus (hopper/ + hopper_softplus/ + cutlass
+# headers); `bash trains/build_fa3_softplus.sh` builds them into its build dir. $NANOCHAT_FA3_FN_DIR
+# overrides; a flash-attention checkout next to this repo (lsq/softplus-fa3) is the fallback.
+_VENDORED_BUILD = os.path.join(_REPO, "third_party", "fa3_softplus", "hopper_softplus", "build")
+_SIBLING_BUILD = os.path.join(os.path.dirname(_REPO), "flash-attention", "hopper_softplus", "build")
+_LIB_DIR = os.environ.get("NANOCHAT_FA3_FN_DIR") or (
+    _VENDORED_BUILD if os.path.isdir(_VENDORED_BUILD) else _SIBLING_BUILD)
 _loaded = {}
 
 
