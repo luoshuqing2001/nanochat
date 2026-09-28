@@ -9,6 +9,7 @@
 #   ARM=rexp_untied     GPUS=2,3 bash ...  # gain lr fixed at its base (diverged at 8x: ~1.4k steps)
 #   ARM=rexp_gamma8     GPUS=... bash ...  # untied, gain lr x8 by hand (= tied at LR_MULT=8)
 #   ARM=rexp_nofp8      GPUS=... bash ...  # untied + FP8 off
+#   ARM=rexp_nogain     GPUS=... bash ...  # output RMSNorm without its learned gain (--attn-gain=0)
 #   ARM=softmax_rmsnorm GPUS=... bash ...  # softmax + the same per-head output RMSNorm + gain (tied)
 #   ARM=softmax         GPUS=... bash ...  # plain softmax
 #   STOP_AT_STEP=3000 (default) leaves the loop there, schedule unchanged; FINAL_EVAL off.
@@ -20,7 +21,7 @@
 set -euo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MUON_VARIANT="${MUON_VARIANT:-moonlight}"
-ARM="${ARM:?set ARM=rexp|rexp_untied|rexp_gamma8|rexp_nofp8|softmax_rmsnorm|softmax}"
+ARM="${ARM:?set ARM=rexp|rexp_untied|rexp_gamma8|rexp_nofp8|rexp_nogain|softmax_rmsnorm|softmax}"
 STOP="${STOP_AT_STEP:-3000}"
 : "${GPUS:?set GPUS, e.g. GPUS=0,1}"
 LR_MULT="${LR_MULT:-8}"
@@ -39,6 +40,7 @@ case "$ARM" in
     rexp_untied)     export ATTN_KIND=rexp_rmsnorm; export ATTN_GAMMA_LR_TIE=0 ;;
     rexp_gamma8)     export ATTN_KIND=rexp_rmsnorm; export ATTN_GAMMA_LR_TIE=0; export ATTN_GAMMA_LR_MULT=8 ;;
     rexp_nofp8)      export ATTN_KIND=rexp_rmsnorm; export ATTN_GAMMA_LR_TIE=0; export FP8=0 ;;
+    rexp_nogain)     export ATTN_KIND=rexp_rmsnorm; set -- --attn-gain=0 "$@" ;;
     softmax_rmsnorm) export ATTN_KIND=softmax_rmsnorm ;;
     softmax)         export ATTN_KIND=softmax ;;
     *) echo "unknown ARM=$ARM" >&2; exit 1 ;;

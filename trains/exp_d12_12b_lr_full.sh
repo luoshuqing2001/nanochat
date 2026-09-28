@@ -7,6 +7,8 @@
 #   ARM=rexp    LR_MULT=1 GAMMA_MULT=4 GPUS=0 bash trains/exp_d12_12b_lr_full.sh
 #   ARM=softmax LR_MULT=2              GPUS=1 bash trains/exp_d12_12b_lr_full.sh
 #   ARM=softmax_rmsnorm ...            (softmax + the per-head output RMSNorm + gain)
+#   ARM=rexp_nogain LR_MULT=1          GPUS=0 bash trains/exp_d12_12b_lr_full.sh
+#                                      (rexp, output RMSNorm without its learned gain: --attn-gain=0)
 #
 # rexp / softmax_rmsnorm: the output RMSNorm gain's lr is GAMMA_MULT x its base, tied to MATRIX_LR
 # (ATTN_GAMMA_LR_TIE=1: x LR_MULT on top); rexp runs NANOCHAT_FA3_DGAIN=2.
@@ -14,7 +16,7 @@
 set -euo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MUON_VARIANT="${MUON_VARIANT:-moonlight}"
-ARM="${ARM:?set ARM=softmax|rexp|softmax_rmsnorm}"
+ARM="${ARM:?set ARM=softmax|rexp|rexp_nogain|softmax_rmsnorm}"
 LR_MULT="${LR_MULT:-1}"
 GAMMA_MULT="${GAMMA_MULT:-1}"
 export CUDA_VISIBLE_DEVICES="${GPUS:?set GPUS, e.g. GPUS=0}"
@@ -24,6 +26,7 @@ export NPROC_PER_NODE="$NGPU"
 case "$ARM" in
     softmax)         export ATTN_KIND=softmax; TAG=softmax ;;
     rexp)            export ATTN_KIND=rexp_rmsnorm; TAG="rexp_g${GAMMA_MULT}" ;;
+    rexp_nogain)     export ATTN_KIND=rexp_rmsnorm; TAG=rexp_nogain; set -- --attn-gain=0 "$@" ;;
     softmax_rmsnorm) export ATTN_KIND=softmax_rmsnorm; TAG="softmax_rmsnorm_g${GAMMA_MULT}" ;;
     *) echo "unknown ARM=$ARM" >&2; exit 1 ;;
 esac

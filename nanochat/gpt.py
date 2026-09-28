@@ -46,6 +46,9 @@ class GPTConfig:
     # output RMSNorm + gain -- an ablation separating the norm from the unnormalized score map
     attn_kind: str = "softmax"
     softplus_alpha: float = 1.0
+    # *_rmsnorm kinds: False drops the learned gain -- the per-head output is only RMS-normalized and
+    # c_proj alone sets the sublayer's scale
+    attn_gain: bool = True
 
 
 def norm(x):
@@ -91,7 +94,8 @@ class CausalSelfAttention(nn.Module):
         self.softplus_alpha = config.softplus_alpha
         # softplus_rmsnorm: per-head RMSNorm gain on the attention output, (n_head * head_dim,)
         rmsnorm_kinds = ("softplus_rmsnorm", "rexp_rmsnorm", "softmax_rmsnorm")
-        self.attn_gamma = nn.Parameter(torch.ones(self.n_embd)) if self.attn_kind in rmsnorm_kinds else None
+        self.attn_gamma = (nn.Parameter(torch.ones(self.n_embd))
+                           if self.attn_kind in rmsnorm_kinds and config.attn_gain else None)
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
@@ -140,13 +144,14 @@ class CausalSelfAttention(nn.Module):
             # Output is RMS-normalised per head; the gain is applied through c_proj below
             import nanochat.fn_rmsnorm_attention as fna
             if kv_cache is None:
-                if (fna.FUSE_PROJ and type(self.c_proj).__name__ == "Float8Linear"
+                if (fna.FUSE_PROJ and self.attn_gamma is not None and type(self.c_proj).__name__ == "Float8Linear"
                         and self.attn_kind != "softplus_rmsnorm"):  # no *_du build of it
                     # attention + gain + FP8 c_proj in one op: the output RMSNorm's backward runs
                     # inside c_proj's grad GEMM (fn_rmsnorm_attention.py, fused_proj_rmsnorm.py)
                     return fna.fn_rmsnorm_attn_proj_fp8(q, k, v, self.attn_kind, self.attn_gamma,
                                                         self.c_proj.weight, window_size=window_size)
-                if type(self.c_proj).__name__ == "Float8Linear" and fna.dgain_ok(q, self.attn_kind):
+                if (self.attn_gamma is not None and type(self.c_proj).__name__ == "Float8Linear"
+                        and fna.dgain_ok(q, self.attn_kind)):
                     # attention and the gain as one autograd node: bit-identical, but the backward
                     # doesn't materialize dy (fn_rmsnorm_attention.py, DGAIN)
                     y = fna.fn_rmsnorm_attn_gain(q, k, v, self.attn_kind, self.attn_gamma, window_size=window_size)

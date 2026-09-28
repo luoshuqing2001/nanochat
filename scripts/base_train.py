@@ -55,6 +55,7 @@ parser.add_argument("--max-seq-len", type=int, default=2048, help="max context l
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--attn-kind", type=str, default="softmax", choices=["softmax", "softmax_rmsnorm", "softplus", "softplus_rmsnorm", "rexp_rmsnorm"], help="attention score map: softmax (FA3/FA4/SDPA), softplus (elementwise, unnormalised, Triton kernel in nanochat/softplus_attention.py), softplus_rmsnorm (softplus + per-head output RMSNorm: FA3 kernels on SM90 via nanochat/fn_rmsnorm_attention.py, FA4 CuTe kernels on SM80/SM120 via nanochat/softplus_rmsnorm_attention.py), or rexp_rmsnorm (a cheaper softplus-shaped function + the same RMSNorm, FA3 kernels on SM90, see nanochat/fn_rmsnorm_attention.py); softmax_rmsnorm is softmax + that per-head output RMSNorm (an ablation: the norm without the unnormalized map)")
 parser.add_argument("--attn-gamma-lr-mult", type=float, default=1.0, help="multiplier on the AdamW lr of the attention output RMSNorm gains (rmsnorm kinds; base lr = scalar_lr * 0.01)")
+parser.add_argument("--attn-gain", type=int, default=1, help="*_rmsnorm kinds: 0 drops the learned per-channel gain of the output RMSNorm (plain normalization; c_proj alone sets the scale)")
 parser.add_argument("--attn-gamma-lr-tie", type=int, default=1, help="1: also scale the gains' lr by matrix_lr / the Muon variant's reference matrix lr (0.004 moonlight, 0.02 nanochat). With an RMS-normalized attention output, the gain and c_proj are the only knobs on the sublayer's scale; untied, a large matrix_lr grows the residual stream and the gain cannot keep up (d12 at 8x matrix_lr: rexp_rmsnorm diverges untied, trains tied)")
 parser.add_argument("--stop-at-step", type=int, default=-1, help="leave the training loop at this step without changing the schedule (-1: run to the end); for short probes of a full run's first steps")
 parser.add_argument("--softplus-alpha", type=float, default=1.0, help="exponent of the n^-alpha length scaling in softplus attention; 1.0 matches softmax's scale behaviour")
@@ -146,7 +147,7 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
-        attn_kind=args.attn_kind, softplus_alpha=args.softplus_alpha,
+        attn_kind=args.attn_kind, softplus_alpha=args.softplus_alpha, attn_gain=bool(args.attn_gain),
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -320,7 +321,9 @@ if weight_decay_scaled != args.weight_decay:
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 attn_gamma_ref_lr = 0.004 if args.muon_variant == "moonlight" else 0.02
 attn_gamma_tie = args.matrix_lr / attn_gamma_ref_lr if args.attn_gamma_lr_tie else 1.0
-if args.attn_kind.endswith("_rmsnorm"):
+if args.attn_kind.endswith("_rmsnorm") and not args.attn_gain:
+    print0("attention RMSNorm gain: off (plain per-head normalization)")
+elif args.attn_kind.endswith("_rmsnorm"):
     print0(f"attention RMSNorm gain lr x{args.attn_gamma_lr_mult * attn_gamma_tie:g} (mult {args.attn_gamma_lr_mult:g}, "
            f"tie {'on' if args.attn_gamma_lr_tie else 'off'}: matrix_lr / {attn_gamma_ref_lr:g} = {attn_gamma_tie:g})")
 optimizer = model.setup_optimizer(
